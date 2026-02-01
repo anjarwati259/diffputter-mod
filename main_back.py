@@ -90,25 +90,14 @@ if __name__ == '__main__':
             train_data = X_miss
  
         batch_size = 4096
-
-        # NOTE: keep algorithm unchanged; only reduce CPU↔GPU overhead.
-        # Convert to float32 tensor once (DataLoader will yield torch tensors on CPU).
-        if not torch.is_tensor(train_data):
-            train_data = torch.as_tensor(train_data, dtype=torch.float32)
-
-        use_cuda = (str(device).startswith('cuda') and torch.cuda.is_available())
-        num_workers = 0 if os.name == 'nt' else 4
-
         train_loader = DataLoader(
             train_data,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=use_cuda,
-            persistent_workers=(num_workers > 0),
+            batch_size = batch_size,
+            shuffle = True,
+            num_workers = 4,
         )
 
-        num_epochs = 10000 + 1
+        num_epochs = 2 + 1
 
         denoise_fn = MLPDiffusion(in_dim, hid_dim).to(device)
 
@@ -118,7 +107,7 @@ if __name__ == '__main__':
         model = Model(denoise_fn = denoise_fn, hid_dim = in_dim).to(device)
 
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=0)
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=50)
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=50, verbose=False)
 
         model.train()
 
@@ -133,22 +122,18 @@ if __name__ == '__main__':
             len_input = 0
  
             for batch in train_loader:
-                # non_blocking transfer works with pin_memory=True
-                inputs = batch.to(device, non_blocking=True)
+                inputs = batch.float().to(device)
+                loss = model(inputs)
 
-                loss = model(inputs).mean()
+                loss = loss.mean()
+                batch_loss += loss.item() * len(inputs)
+                len_input += len(inputs)
 
-                # Avoid per-batch GPU sync from loss.item(); aggregate on GPU then sync once/epoch
-                if not torch.is_tensor(batch_loss):
-                    batch_loss = torch.zeros((), device=device)
-                batch_loss += loss.detach() * inputs.size(0)
-                len_input += inputs.size(0)
-
-                optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-            curr_loss = (batch_loss/len_input).item() if torch.is_tensor(batch_loss) else (batch_loss/len_input)
+            curr_loss = batch_loss/len_input
             scheduler.step(curr_loss)
 
             if curr_loss < best_loss:
@@ -174,24 +159,32 @@ if __name__ == '__main__':
 
         rec_Xs = []
 
-        # Pre-compute masked input once (same across trials) and keep tensors on GPU
-        mask_train_f = mask_train.to(torch.float32, device=device)
-        impute_X = ((1. - mask_train_f) * X).to(device)
+        for trial in tqdm(range(num_trials), desc='In-sample imputation'):
+        
+            X_miss = (1. - mask_train.float()) * X
+            X_miss = X_miss.to(device)
+            impute_X = X_miss
+  
+            in_dim = X.shape[1]
 
-        in_dim = X.shape[1]
-        denoise_fn = MLPDiffusion(in_dim, hid_dim).to(device)
-        model = Model(denoise_fn=denoise_fn, hid_dim=in_dim).to(device)
-        model.load_state_dict(torch.load(f'{ckpt_dir}/{iteration}/model.pt', map_location=device))
-        model.eval()
-        net = model.denoise_fn_D
+            denoise_fn = MLPDiffusion(in_dim, hid_dim).to(device)
 
-        num_samples, dim = X.shape[0], X.shape[1]
+            model = Model(denoise_fn = denoise_fn, hid_dim = in_dim).to(device)
+            model.load_state_dict(torch.load(f'{ckpt_dir}/{iteration}/model.pt'))
 
-        with torch.no_grad():
-            for trial in tqdm(range(num_trials), desc='In-sample imputation'):
-                rec_X = impute_mask(net, impute_X, mask_train, num_samples, dim, num_steps, device)
-                rec_X = rec_X * mask_train_f + impute_X * (1 - mask_train_f)
-                rec_Xs.append(rec_X)
+            # ==========================================================
+
+            net = model.denoise_fn_D
+
+            num_samples, dim = X.shape[0], X.shape[1]
+            rec_X = impute_mask(net, impute_X, mask_train, num_samples, dim, num_steps, device)
+            
+            mask_int = mask_train.to(torch.float).to(device)
+            rec_X = rec_X * mask_int + impute_X * (1-mask_int)
+            rec_Xs.append(rec_X)
+            
+            
+
         rec_X = torch.stack(rec_Xs, dim = 0).mean(0) 
 
         rec_X = rec_X.cpu().numpy() * 2
@@ -216,25 +209,32 @@ if __name__ == '__main__':
 
         rec_Xs = []
 
-        # Pre-compute masked input once (same across trials) and keep tensors on GPU
-        mask_test_f = mask_test.to(torch.float32, device=device)
-        impute_X = ((1. - mask_test_f) * X_test).to(device)
+        for trial in tqdm(range(num_trials), desc='Out-of-sample imputation'):
+            
+            # For out-of-sample imputation, no results from previous iterations are used
 
-        in_dim = X_test.shape[1]
-        denoise_fn = MLPDiffusion(in_dim, hid_dim).to(device)
-        model = Model(denoise_fn=denoise_fn, hid_dim=in_dim).to(device)
-        model.load_state_dict(torch.load(f'{ckpt_dir}/{iteration}/model.pt', map_location=device))
-        model.eval()
-        net = model.denoise_fn_D
+            X_miss = (1. - mask_test.float()) * X_test
+            X_miss = X_miss.to(device)
+            impute_X = X_miss
 
-        num_samples, dim = X_test.shape[0], X_test.shape[1]
+            in_dim = X_test.shape[1]
 
-        with torch.no_grad():
-            for trial in tqdm(range(num_trials), desc='Out-of-sample imputation'):
-                # For out-of-sample imputation, no results from previous iterations are used
-                rec_X = impute_mask(net, impute_X, mask_test, num_samples, dim, num_steps, device)
-                rec_X = rec_X * mask_test_f + impute_X * (1 - mask_test_f)
-                rec_Xs.append(rec_X)
+            denoise_fn = MLPDiffusion(in_dim, hid_dim).to(device)
+
+            model = Model(denoise_fn = denoise_fn, hid_dim = in_dim).to(device)
+            model.load_state_dict(torch.load(f'{ckpt_dir}/{iteration}/model.pt'))
+
+            # ==========================================================
+            net = model.denoise_fn_D
+
+            num_samples, dim = X_test.shape[0], X_test.shape[1]
+            rec_X = impute_mask(net, impute_X, mask_test, num_samples, dim, num_steps, device)
+            
+            mask_int = mask_test.to(torch.float).to(device)
+            rec_X = rec_X * mask_int + impute_X * (1-mask_int)
+            rec_Xs.append(rec_X)
+            
+    
         rec_X = torch.stack(rec_Xs, dim = 0).mean(0) 
 
         rec_X = rec_X.cpu().numpy() * 2
