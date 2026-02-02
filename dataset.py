@@ -168,39 +168,78 @@ def mean_std(data, mask):
     std = np.sqrt(var)
     return mean, std
 
-def get_eval(dataname, X_recon, X_true, truth_cat_idx, num_num, cat_bin_num, mask, oos = False):
-
-    data_dir = f'datasets/{dataname}'
-
+def get_eval(dataname, X_recon, X_true, truth_cat_idx, num_num, cat_bin_num, mask, oos=False):
+    
     info_path = f'datasets/Info/{dataname}.json'
-
     with open(info_path, 'r') as f:
         info = json.load(f)
-    
+
     num_col_idx = info['num_col_idx']
     cat_col_idx = info['cat_col_idx']
 
+    # mask di repo ini: True(1) = missing, False(0) = observed
     num_mask = mask[:, num_col_idx].astype(bool)
-    cat_mask = mask[:, cat_col_idx].astype(bool)
+    cat_mask = mask[:, cat_col_idx].astype(bool) if len(cat_col_idx) > 0 else None
 
     num_pred = X_recon[:, :num_num]
-    cat_pred = X_recon[:, num_num:]
-
-    num_cat = len(cat_col_idx)
+    cat_pred_bits = X_recon[:, num_num:]  # ini sudah kamu "de-standardize" di main.py untuk bagian cat
 
     num_true = X_true[:, :num_num]
-    cat_true = truth_cat_idx
 
-    if dataname == 'news' and oos == True:
-        num_mask = np.delete(num_mask, 6265, axis=0)
-        num_pred = np.delete(num_pred, 6265, axis=0)
-        num_true = np.delete(num_true, 6265, axis=0)
+    # special-case dari repo: buang 1 baris di news oos (biar align)
+    if dataname == 'news' and oos is True:
+        drop = 6265
+        num_mask = np.delete(num_mask, drop, axis=0)
+        num_pred = np.delete(num_pred, drop, axis=0)
+        num_true = np.delete(num_true, drop, axis=0)
+        if cat_mask is not None:
+            cat_mask = np.delete(cat_mask, drop, axis=0)
+        if truth_cat_idx is not None:
+            truth_cat_idx = np.delete(truth_cat_idx, drop, axis=0)
+        cat_pred_bits = np.delete(cat_pred_bits, drop, axis=0)
 
+    # ===== continuous metrics (sesuai repo & paper: hanya di posisi missing) =====
     div = num_pred[num_mask] - num_true[num_mask]
     mae = np.abs(div).mean()
-    rmse = np.sqrt((div**2).mean())
-        
-    mae = np.abs(div).mean()
-    rmse = np.sqrt((div**2).mean())
+    rmse = np.sqrt((div ** 2).mean())
 
-    return mae, rmse
+    # ===== discrete metric: Accuracy (hanya pada missing entries) =====
+    acc = np.nan
+    if (truth_cat_idx is not None) and (len(cat_col_idx) > 0) and (cat_bin_num is not None):
+        cat_bin_num = np.array(cat_bin_num).astype(int)
+        ends = np.cumsum(cat_bin_num)
+        starts = np.concatenate(([0], ends[:-1]))
+
+        correct_total = 0
+        total_missing = 0
+
+        # helper: bits -> int
+        def bits_to_int(bits_2d):
+            # threshold 0.5 lalu hitung integer biner (MSB di kolom pertama)
+            b = bits_2d.shape[1]
+            bits01 = (bits_2d >= 0.5).astype(np.int64)
+            weights = (1 << np.arange(b - 1, -1, -1, dtype=np.int64))
+            return bits01 @ weights
+
+        for j, (s, e) in enumerate(zip(starts, ends)):
+            rows_miss = cat_mask[:, j]
+            if rows_miss.sum() == 0:
+                continue
+
+            pred_idx = bits_to_int(cat_pred_bits[:, s:e])
+            true_idx = truth_cat_idx[:, j].astype(np.int64)
+
+            # jumlah kelas valid (berdasarkan ground-truth)
+            nclass = int(true_idx.max()) + 1
+            valid = pred_idx < nclass
+
+            correct = ((pred_idx == true_idx) & valid & rows_miss).sum()
+            total = rows_miss.sum()
+
+            correct_total += int(correct)
+            total_missing += int(total)
+
+        if total_missing > 0:
+            acc = correct_total / total_missing
+
+    return mae, rmse, acc

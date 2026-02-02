@@ -24,7 +24,7 @@ parser.add_argument('--max_iter', type=int, default=10, help='Maximum iteration.
 parser.add_argument('--ratio', type=str, default=30, help='Masking ratio.')
 parser.add_argument('--hid_dim', type=int, default=1024, help='Hidden dimension.')
 parser.add_argument('--mask', type=str, default='MCAR', help='Masking machenisms.')
-parser.add_argument('--num_trials', type=int, default=20, help='Number of sampling times.')
+parser.add_argument('--num_trials', type=int, default=2, help='Number of sampling times.')
 parser.add_argument('--num_steps', type=int, default=50, help='Number of diffusion steps.')
 
 args = parser.parse_args()
@@ -66,9 +66,11 @@ if __name__ == '__main__':
 
     MAEs = []
     RMSEs = []
+    ACCs = []
 
     MAEs_out = []
     RMSEs_out = []
+    ACCs_out = []
 
     start_time = time.time()
     for iteration in range(args.max_iter):
@@ -97,7 +99,7 @@ if __name__ == '__main__':
             num_workers = 4,
         )
 
-        num_epochs = 10000 + 1
+        num_epochs = 10 + 1
 
         denoise_fn = MLPDiffusion(in_dim, hid_dim).to(device)
 
@@ -198,12 +200,13 @@ if __name__ == '__main__':
         res = pred_X[:, len_num:] * std_X[len_num:] + mean_X[len_num:]
         pred_X[:, len_num:] = res
 
-        mae, rmse = get_eval(dataname, pred_X, X_true, train_cat_idx, train_num.shape[1], cat_bin_num, ori_train_mask)
+        mae, rmse, acc = get_eval(dataname, pred_X, X_true,train_cat_idx, train_num.shape[1],cat_bin_num, ori_train_mask)
         MAEs.append(mae)
         RMSEs.append(rmse)
+        ACCs.append(acc)
 
 
-        print('in-sample',mae, rmse)
+        print('in-sample',mae, rmse, acc)
 
         # out-of_sample_imputation
 
@@ -245,9 +248,10 @@ if __name__ == '__main__':
         res = pred_X[:, len_num:] * std_X[len_num:] + mean_X[len_num:]
         pred_X[:, len_num:] = res
 
-        mae_out, rmse_out = get_eval(dataname, pred_X, X_true, test_cat_idx, test_num.shape[1], cat_bin_num, ori_test_mask, oos = True)
+        mae_out, rmse_out, acc_out = get_eval(dataname, pred_X, X_true,test_cat_idx, test_num.shape[1],cat_bin_num, ori_test_mask, oos=True)
         MAEs_out.append(mae_out)
         RMSEs_out.append(rmse_out)
+        ACCs_out.append(acc_out)
 
         result_save_path = f'results/{dataname}/rate{ratio}/{mask_type}/{split_idx}/{num_trials}_{num_steps}'
         os.makedirs(result_save_path) if not os.path.exists(result_save_path) else None
@@ -256,7 +260,8 @@ if __name__ == '__main__':
 
             f.write(f'iteration {iteration}, MAE: in-sample: {mae}, out-of-sample: {mae_out} \n')
             f.write(f'iteration {iteration}: RMSE: in-sample: {rmse}, out-of-sample: {rmse_out} \n')
+            f.write(f'iteration {iteration}: ACC: in-sample: {acc}, out-of-sample: {acc_out} \n')
 
-        print('out-of-sample', mae_out, rmse_out)
+        print('out-of-sample', mae_out, rmse_out, acc_out)
 
         print(f'saving results to {result_save_path}')

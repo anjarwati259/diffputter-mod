@@ -20,26 +20,26 @@ parser = argparse.ArgumentParser(description='Missing Value Imputation')
 parser.add_argument('--dataname', type=str, default='california', help='Name of dataset.')
 parser.add_argument('--gpu', type=int, default=0, help='GPU index.')
 parser.add_argument('--split_idx', type=int, default=0, help='Split idx.')
-parser.add_argument('--max_iter', type=int, default=10, help='Maximum iteration.')
+parser.add_argument('--max_iter', type=int, default=5, help='Maximum iteration.')
 parser.add_argument('--ratio', type=str, default=30, help='Masking ratio.')
 parser.add_argument('--hid_dim', type=int, default=1024, help='Hidden dimension.')
 parser.add_argument('--mask', type=str, default='MCAR', help='Masking machenisms.')
-parser.add_argument('--num_trials', type=int, default=2, help='Number of sampling times.')
+parser.add_argument('--num_trials', type=int, default=10, help='Number of sampling times.')
 parser.add_argument('--num_steps', type=int, default=50, help='Number of diffusion steps.')
 
 args = parser.parse_args()
 
 # check cuda
 if args.gpu != -1 and torch.cuda.is_available():
-    print("1")
     args.device = f'cuda:{args.gpu}'
 else:
     args.device = 'cpu'
 
 
-# print("CUDA available:", torch.cuda.is_available())
-# print("GPU count:", torch.cuda.device_count())
-# print("GPU name:", torch.cuda.get_device_name(0))
+def _sync_if_cuda(device: str):
+    """Synchronize CUDA for accurate timing (GPU ops are async)."""
+    if torch.cuda.is_available() and str(device).startswith("cuda"):
+        torch.cuda.synchronize()
 
 
 if __name__ == '__main__':
@@ -55,6 +55,14 @@ if __name__ == '__main__':
 
     if mask_type == 'MNAR':
         mask_type = 'MNAR_logistic_T2'
+
+    # === Create result path ONCE (so we can log total time safely) ===
+    result_save_path = f'results/{dataname}/rate{ratio}/{mask_type}/{split_idx}/{num_trials}_{num_steps}'
+    os.makedirs(result_save_path, exist_ok=True)
+
+    # === Total runtime timer (1 run) ===
+    _sync_if_cuda(device)
+    run_t0 = time.perf_counter()
 
     train_X, test_X, ori_train_mask, ori_test_mask, train_num, test_num, train_cat_idx, test_cat_idx, train_mask, test_mask, cat_bin_num = load_dataset(dataname, split_idx, mask_type, ratio)
     
@@ -72,12 +80,20 @@ if __name__ == '__main__':
 
     MAEs = []
     RMSEs = []
+    ACCs = []
 
     MAEs_out = []
     RMSEs_out = []
+    ACCs_out = []
 
+    # NOTE: Keep original start_time if you still want it, but we use perf_counter timing.
     start_time = time.time()
+
     for iteration in range(args.max_iter):
+
+        # === Iteration (EM) timer: includes M-step + E-step + eval + saving ===
+        _sync_if_cuda(device)
+        iter_t0 = time.perf_counter()
 
         ## M-Step: Density Estimation
      
@@ -114,7 +130,7 @@ if __name__ == '__main__':
             persistent_workers=(num_workers > 0),
         )
 
-        num_epochs = 100 + 1
+        num_epochs = 10000 + 1
 
         denoise_fn = MLPDiffusion(in_dim, hid_dim).to(device)
 
@@ -122,7 +138,6 @@ if __name__ == '__main__':
             print(denoise_fn)
 
         model = Model(denoise_fn = denoise_fn, hid_dim = in_dim).to(device)
-        print(device)
 
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=0)
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=50)
@@ -131,6 +146,10 @@ if __name__ == '__main__':
 
         best_loss = float('inf')
         patience = 0
+
+        # === M-step timer (training only) ===
+        _sync_if_cuda(device)
+        m_t0 = time.perf_counter()
 
         # progress bar
         pbar = tqdm(range(num_epochs), desc='Training')
@@ -173,9 +192,17 @@ if __name__ == '__main__':
             if epoch % 1000 == 0:
                 torch.save(model.state_dict(), f'{ckpt_dir}/{iteration}/model_{epoch}.pt')
 
+        _sync_if_cuda(device)
+        m_sec = time.perf_counter() - m_t0
+        print(f"[TIME] iter {iteration}: M_step_sec = {m_sec:.3f}s")
+
         end_time = time.time()
 
-    ## E-Step: Missing Value Imputation
+        ## E-Step: Missing Value Imputation
+
+        # === E-step timer (imputation + eval only) ===
+        _sync_if_cuda(device)
+        e_t0 = time.perf_counter()
 
         # In-sample imputation
 
@@ -214,19 +241,22 @@ if __name__ == '__main__':
         res = pred_X[:, len_num:] * std_X[len_num:] + mean_X[len_num:]
         pred_X[:, len_num:] = res
 
-        mae, rmse = get_eval(dataname, pred_X, X_true, train_cat_idx, train_num.shape[1], cat_bin_num, ori_train_mask)
+        mae, rmse, acc = get_eval(
+            dataname, pred_X, X_true,
+            train_cat_idx, train_num.shape[1],
+            cat_bin_num, ori_train_mask
+        )
         MAEs.append(mae)
         RMSEs.append(rmse)
+        ACCs.append(acc)
 
-
-        print('in-sample',mae, rmse)
+        print('in-sample', mae, rmse, 'ACC', acc)
 
         # out-of_sample_imputation
 
         rec_Xs = []
 
         # Pre-compute masked input once (same across trials) and keep tensors on GPU
-        #mask_test_f = mask_test.to(torch.float32, device=device)
         mask_test_f = mask_test.to(device=device, dtype=torch.float32)
         impute_X = ((1. - mask_test_f) * X_test).to(device)
 
@@ -255,18 +285,37 @@ if __name__ == '__main__':
         res = pred_X[:, len_num:] * std_X[len_num:] + mean_X[len_num:]
         pred_X[:, len_num:] = res
 
-        mae_out, rmse_out = get_eval(dataname, pred_X, X_true, test_cat_idx, test_num.shape[1], cat_bin_num, ori_test_mask, oos = True)
+        mae_out, rmse_out, acc_out = get_eval(
+            dataname, pred_X, X_true,
+            test_cat_idx, test_num.shape[1],
+            cat_bin_num, ori_test_mask, oos=True
+        )
         MAEs_out.append(mae_out)
         RMSEs_out.append(rmse_out)
+        ACCs_out.append(acc_out)
 
-        result_save_path = f'results/{dataname}/rate{ratio}/{mask_type}/{split_idx}/{num_trials}_{num_steps}'
-        os.makedirs(result_save_path) if not os.path.exists(result_save_path) else None
+        _sync_if_cuda(device)
+        e_sec = time.perf_counter() - e_t0
+        print(f"[TIME] iter {iteration}: E_step_sec = {e_sec:.3f}s")
 
-        with open (f'{result_save_path}/result.txt', 'a+') as f:
+        # === Iteration total time ===
+        _sync_if_cuda(device)
+        iter_sec = time.perf_counter() - iter_t0
+        print(f"[TIME] iter {iteration}: TOTAL_iter_sec = {iter_sec:.3f}s")
 
+        with open (f'{result_save_path}/result.txt', 'a+', encoding='utf-8') as f:
             f.write(f'iteration {iteration}, MAE: in-sample: {mae}, out-of-sample: {mae_out} \n')
             f.write(f'iteration {iteration}: RMSE: in-sample: {rmse}, out-of-sample: {rmse_out} \n')
+            f.write(f'iteration {iteration}: ACC: in-sample: {acc}, out-of-sample: {acc_out} \n')
+            f.write(f'iteration {iteration}: TIME_M_SEC: {m_sec:.6f}, TIME_E_SEC: {e_sec:.6f}, TIME_TOTAL_SEC: {iter_sec:.6f}\n')
 
         print('out-of-sample', mae_out, rmse_out)
-
         print(f'saving results to {result_save_path}')
+
+    # === Total runtime end ===
+    _sync_if_cuda(device)
+    run_total_sec = time.perf_counter() - run_t0
+    print(f"[TIME] total_run_sec = {run_total_sec:.3f}s")
+
+    with open(f'{result_save_path}/time_log.txt', 'a+', encoding='utf-8') as f:
+        f.write(f"TOTAL_RUN_SEC: {run_total_sec:.6f}\n")
