@@ -21,11 +21,11 @@ parser = argparse.ArgumentParser(description='Missing Value Imputation')
 parser.add_argument('--dataname',   type=str, default='california', help='Name of dataset.')
 parser.add_argument('--gpu',        type=int, default=0,            help='GPU index.')
 parser.add_argument('--split_idx',  type=int, default=0,            help='Split idx.')
-parser.add_argument('--max_iter',   type=int, default=5,            help='Maximum iteration.')
+parser.add_argument('--max_iter',   type=int, default=10,            help='Maximum iteration.')
 parser.add_argument('--ratio',      type=str, default=30,           help='Masking ratio.')
 parser.add_argument('--hid_dim',    type=int, default=1024,         help='Hidden dimension.')
 parser.add_argument('--mask',       type=str, default='MCAR',       help='Masking mechanism.')
-parser.add_argument('--num_trials', type=int, default=10,            help='Number of sampling times.')
+parser.add_argument('--num_trials', type=int, default=20,            help='Number of sampling times.')
 parser.add_argument('--num_steps',  type=int, default=50,           help='Number of diffusion steps.')
 
 args = parser.parse_args()
@@ -75,8 +75,18 @@ if __name__ == '__main__':
      emb_sizes,
      mdlp,           # [BARU] MDLPDiscretizer (atau None jika tidak ada numerik)
      bin_midpoints,  # [BARU] list[n_num_cols] midpoint per bin, skala normalisasi
-     n_num_cols      # [BARU] jumlah kolom numerik
+     n_num_cols,     # [BARU] jumlah kolom numerik
+     t_mdlp,         # [BARU] waktu komputasi MDLP discretization (detik)
+     t_emb           # [BARU] waktu komputasi embedding training (detik)
      ) = load_dataset(dataname, split_idx, mask_type, ratio)
+
+    t_total_preprocessing = t_mdlp + t_emb
+    print(f'\n{"="*60}')
+    print(f'[TIMING] Ringkasan Waktu Komputasi Preprocessing:')
+    print(f'  - MDLP Discretization : {t_mdlp:.4f}s')
+    print(f'  - Embedding Training  : {t_emb:.4f}s')
+    print(f'  - Total (Diskrit→Emb) : {t_total_preprocessing:.4f}s')
+    print(f'{"="*60}')
 
     # Setelah load_dataset selesai, aktifkan default device ke CUDA.
     torch.set_default_device(device)
@@ -222,7 +232,7 @@ if __name__ == '__main__':
                            f'{ckpt_dir}/{iteration}/model_{epoch}.pt')
 
         end_time = time.time()
-        print(f'Training time: {end_time - start_time:.2f}s')
+        print(f'Training time: {end_time - start_time:.4f}s')
 
         # =====================================================================
         #  E-Step: In-sample Imputation
@@ -385,7 +395,20 @@ if __name__ == '__main__':
                             f'{split_idx}/{num_trials}_{num_steps}')
         os.makedirs(result_save_path, exist_ok=True)
 
-        with open(f'{result_save_path}/result_mdlpwith2.txt', 'a+') as f:
+        t_train          = end_time - start_time
+        t_impute_in      = impute_end_time - impute_start_time
+        t_impute_out     = oos_end - oos_start
+        t_total_pipeline = t_mdlp + t_emb + t_train + t_impute_in + t_impute_out
+
+        print(f'\n[TIMING] Iteration {iteration} — Ringkasan Waktu:')
+        print(f'  - MDLP Discretization         : {t_mdlp:.4f}s')
+        print(f'  - Embedding Training           : {t_emb:.4f}s')
+        print(f'  - Diffusion Training           : {t_train:.4f}s')
+        print(f'  - In-sample Imputation         : {t_impute_in:.4f}s')
+        print(f'  - Out-of-sample Imputation     : {t_impute_out:.4f}s')
+        print(f'  - TOTAL (Diskrit→Imputasi)     : {t_total_pipeline:.4f}s')
+
+        with open(f'{result_save_path}/result_mdlpwith.txt', 'a+', encoding='utf-8') as f:
             f.write(
                 f'iteration {iteration}, '
                 f'MAE: in-sample={mae:.6f}, out-of-sample={mae_out:.6f}\n'
@@ -400,9 +423,19 @@ if __name__ == '__main__':
             )
             f.write(
                 f'iteration {iteration}, '
-                f'Training time={end_time - start_time:.2f}s, '
-                f'In-sample imputation={impute_end_time - impute_start_time:.2f}s, '
-                f'Out-of-sample imputation={oos_end - oos_start:.2f}s\n\n'
+                f'Training time={t_train:.4f}s, '
+                f'In-sample imputation={t_impute_in:.4f}s, '
+                f'Out-of-sample imputation={t_impute_out:.4f}s\n'
+            )
+            f.write(
+                f'iteration {iteration}, '
+                f'MDLP discretization={t_mdlp:.4f}s, '
+                f'Embedding training={t_emb:.4f}s, '
+                f'Total preprocessing (Diskrit+Emb)={t_mdlp + t_emb:.4f}s\n'
+            )
+            f.write(
+                f'iteration {iteration}, '
+                f'TOTAL pipeline (Diskrit-Imputasi)={t_total_pipeline:.4f}s\n\n'
             )
 
         print(f'Results saved to {result_save_path}')
