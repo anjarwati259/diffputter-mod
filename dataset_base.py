@@ -4,7 +4,6 @@ from torch.utils.data import Dataset
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 import os
 import json
-import torch
 
 DATA_DIR = 'datasets'
 
@@ -83,9 +82,6 @@ def load_dataset(dataname, idx = 0, mask_type = 'MCAR', ratio = '30'):
                 category_to_binary = {category: format(index, '0' + str(num_bits) + 'b') for index, category in enumerate(categories)}
                 category_to_idx = {category: index for index, category in enumerate(categories)}
 
-            #     for category, binary_encoding in category_to_binary.items():
-            #         print(f'{category}: {binary_encoding}')
-
                 with open(map_path_bin, 'w') as f:
                     json.dump(category_to_binary, f)
                 with open(map_path_idx, 'w') as f:
@@ -160,68 +156,137 @@ def load_dataset(dataname, idx = 0, mask_type = 'MCAR', ratio = '30'):
     return train_X, test_X, train_mask, test_mask, train_num, test_num, train_cat_idx, test_cat_idx, extend_train_mask, extend_test_mask, cat_bin_num
 
 def mean_std(data, mask):
-    # data dan mask dikonversi ke GPU tensor untuk komputasi
-    device = data.device if isinstance(data, torch.Tensor) else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if not isinstance(data, torch.Tensor):
-        data = torch.tensor(data, device=device)
-    if not isinstance(mask, torch.Tensor):
-        mask = torch.tensor(mask, device=device)
-
     mask = ~mask
-    mask = mask.float()
+    mask = mask.astype(np.float32)
     mask_sum = mask.sum(0)
     mask_sum[mask_sum == 0] = 1
     mean = (data * mask).sum(0) / mask_sum
     var = ((data - mean) ** 2 * mask).sum(0) / mask_sum
-    std = torch.sqrt(var)
+    std = np.sqrt(var)
     return mean, std
 
-def get_eval(dataname, X_recon, X_true, truth_cat_idx, num_num, cat_bin_num, mask, oos = False):
 
-    data_dir = f'datasets/{dataname}'
+def _bits_to_int(bits):
+    """
+    Konversi array binary bits ke integer.
+    Ekuivalen dengan argmax pada one-hot, tapi untuk binary encoding.
+
+    Contoh:
+        bits = [0, 1, 1]  →  0*4 + 1*2 + 1*1 = 3
+        bits = [1, 0, 0]  →  1*4 + 0*2 + 0*1 = 4
+
+    Parameter:
+        bits : np.ndarray, shape (N, b) — nilai kontinu hasil prediksi model
+                                          (belum di-round, range bebas)
+
+    Return:
+        idx  : np.ndarray, shape (N,) — integer label hasil decoding
+    """
+    b = bits.shape[1]
+    # Round ke 0/1 terlebih dahulu (sesuai semangat argmax: pilih nilai terbesar/terkecil)
+    bits_rounded = (bits > 0.5).astype(np.int32)
+
+    # Bobot posisi bit: [2^(b-1), 2^(b-2), ..., 2^0]
+    powers = (2 ** np.arange(b - 1, -1, -1)).astype(np.int32)  # shape (b,)
+
+    # Dot product → integer index per baris
+    idx = bits_rounded.dot(powers)  # shape (N,)
+    return idx
+
+
+def get_eval(dataname, X_recon, X_true, truth_cat_idx, num_num, cat_bin_num, mask, oos=False):
+    """
+    Menghitung MAE, RMSE (untuk kolom numerik), dan Accuracy (untuk kolom kategorik)
+    hanya pada posisi missing (mask == True).
+
+    Logika Accuracy:
+    ----------------
+    Paper menyebutkan "argmax" setelah one-hot decoding. Karena implementasi ini
+    memakai binary encoding (bukan one-hot), maka padanannya adalah:
+
+        1. Round prediksi bit ke 0/1  →  binary string hasil prediksi
+        2. Konversi binary → integer  →  predicted label index
+        3. Bandingkan dengan ground-truth label index (truth_cat_idx)
+
+    Ini sepenuhnya deterministik dan tidak bergantung pada distribusi prediksi,
+    sehingga konsisten dengan semangat argmax di paper.
+    """
 
     info_path = f'datasets/Info/{dataname}.json'
-
     with open(info_path, 'r') as f:
         info = json.load(f)
-    
+
     num_col_idx = info['num_col_idx']
     cat_col_idx = info['cat_col_idx']
 
-    # mask, X_recon, X_true dikonversi ke GPU tensor untuk komputasi
-    device = X_recon.device if isinstance(X_recon, torch.Tensor) else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if not isinstance(mask, torch.Tensor):
-        mask = torch.tensor(mask, device=device)
-    if not isinstance(X_recon, torch.Tensor):
-        X_recon = torch.tensor(X_recon, device=device)
-    if not isinstance(X_true, torch.Tensor):
-        X_true = torch.tensor(X_true, device=device)
-
-    num_mask = mask[:, num_col_idx].bool()
-    cat_mask = mask[:, cat_col_idx].bool()
+    # True(1) = missing, False(0) = observed
+    num_mask = mask[:, num_col_idx].astype(bool)
+    cat_mask = mask[:, cat_col_idx].astype(bool) if len(cat_col_idx) > 0 else None
 
     num_pred = X_recon[:, :num_num]
-    cat_pred = X_recon[:, num_num:]
-
-    num_cat = len(cat_col_idx)
+    cat_pred_bits = X_recon[:, num_num:]
 
     num_true = X_true[:, :num_num]
-    cat_true = truth_cat_idx
 
-    if dataname == 'news' and oos == True:
-        # torch tidak punya np.delete, gunakan index selection
-        idx = list(range(num_mask.shape[0]))
-        idx.pop(6265)
-        idx_tensor = torch.tensor(idx, device=device)
-        num_mask = num_mask[idx_tensor]
-        num_pred = num_pred[idx_tensor]
-        num_true = num_true[idx_tensor]
+    # Special-case: buang 1 baris di news oos agar dimensi align
+    if dataname == 'news' and oos is True:
+        drop = 6265
+        num_mask = np.delete(num_mask, drop, axis=0)
+        num_pred = np.delete(num_pred, drop, axis=0)
+        num_true = np.delete(num_true, drop, axis=0)
+        if cat_mask is not None:
+            cat_mask = np.delete(cat_mask, drop, axis=0)
+        if truth_cat_idx is not None:
+            truth_cat_idx = np.delete(truth_cat_idx, drop, axis=0)
+        cat_pred_bits = np.delete(cat_pred_bits, drop, axis=0)
 
+    # ===== Continuous metrics: hanya pada posisi missing =====
     div = num_pred[num_mask] - num_true[num_mask]
-    mae = div.abs().mean().item()
-    rmse = (div**2).mean().sqrt().item()
-        
-    mae = div.abs().mean().item()
-    rmse = (div**2).mean().sqrt().item()
+    mae  = np.abs(div).mean()
+    rmse = np.sqrt((div ** 2).mean())
 
-    return mae, rmse
+    # ===== Discrete metric: Accuracy hanya pada posisi missing =====
+    acc = np.nan
+    if (truth_cat_idx is not None) and (len(cat_col_idx) > 0) and (cat_bin_num is not None):
+
+        cat_bin_num = np.array(cat_bin_num).astype(int)
+        ends   = np.cumsum(cat_bin_num)
+        starts = np.concatenate(([0], ends[:-1]))
+
+        correct_total = 0
+        total_missing = 0
+
+        for j, (s, e) in enumerate(zip(starts, ends)):
+
+            rows_miss = cat_mask[:, j]          # boolean mask baris yang missing
+            if rows_miss.sum() == 0:
+                continue
+
+            # Prediksi bit untuk kolom kategorik ke-j
+            pred_bits = cat_pred_bits[:, s:e]           # shape (N, b)
+
+            # Ground-truth label index
+            true_idx = truth_cat_idx[:, j].astype(int)  # shape (N,)
+
+            # ===========================================================
+            # ARGMAX via binary decoding (pengganti argmax one-hot):
+            #   round bit prediksi → 0/1, lalu ubah ke integer
+            # ===========================================================
+            pred_idx = _bits_to_int(pred_bits)           # shape (N,)
+
+            # Clamp: jika hasil decoding melebihi jumlah kelas valid,
+            # anggap sebagai prediksi salah (tidak di-assign ke kelas manapun)
+            nclass = int(true_idx.max()) + 1
+            pred_idx = np.clip(pred_idx, 0, nclass - 1)
+
+            # Hitung correct hanya pada baris yang missing
+            correct = ((pred_idx == true_idx) & rows_miss).sum()
+            total   = rows_miss.sum()
+
+            correct_total += int(correct)
+            total_missing += int(total)
+
+        if total_missing > 0:
+            acc = correct_total / total_missing
+
+    return mae, rmse, acc

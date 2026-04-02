@@ -2,7 +2,7 @@ import os
 import torch
 
 import numpy as np
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import argparse
 import warnings
@@ -10,7 +10,7 @@ import time
 from tqdm import tqdm
 
 from model import MLPDiffusion, Model
-from dataset_base import load_dataset, get_eval, mean_std
+from dataset import load_dataset, get_eval, mean_std
 from diffusion_utils import sample_step, impute_mask
 
 warnings.filterwarnings('ignore')
@@ -29,11 +29,15 @@ parser.add_argument('--num_steps', type=int, default=50, help='Number of diffusi
 
 args = parser.parse_args()
 
-# check cuda
-if args.gpu != -1 and torch.cuda.is_available():
-    args.device = f'cuda:{args.gpu}'
-else:
-    args.device = 'cpu'
+# Force GPU usage - akan error jika GPU tidak tersedia
+if not torch.cuda.is_available():
+    raise RuntimeError("GPU tidak tersedia! Script ini membutuhkan GPU untuk berjalan.")
+
+args.device = f'cuda:{args.gpu}'
+torch.cuda.set_device(args.gpu)
+
+# Set default tensor type ke CUDA
+torch.set_default_device(args.device)
 
 
 if __name__ == '__main__':
@@ -52,25 +56,27 @@ if __name__ == '__main__':
 
     train_X, test_X, ori_train_mask, ori_test_mask, train_num, test_num, train_cat_idx, test_cat_idx, train_mask, test_mask, cat_bin_num = load_dataset(dataname, split_idx, mask_type, ratio)
     
-    # Pindahkan ke GPU lebih awal agar mean_std berjalan di GPU
-    train_X_gpu = torch.tensor(train_X, device=device)
-    train_mask_gpu = torch.tensor(train_mask, device=device)
-
-    mean_X, std_X = mean_std(train_X_gpu, train_mask_gpu)    
+    mean_X, std_X = mean_std(train_X, train_mask)    
     in_dim = train_X.shape[1]
 
-    # Normalisasi langsung di GPU
-    X = (torch.tensor(train_X, device=device) - mean_X) / std_X / 2
-    X_test = (torch.tensor(test_X, device=device) - mean_X) / std_X / 2
-
-    mask_train = torch.tensor(train_mask, device=device)
-    mask_test = torch.tensor(test_mask, device=device)
+    # Langsung convert ke GPU tensor
+    X = torch.tensor((train_X - mean_X) / std_X / 2, device=device, dtype=torch.float32)
+    X_test = torch.tensor((test_X - mean_X) / std_X / 2, device=device, dtype=torch.float32)
+    
+    mask_train = torch.tensor(train_mask, device=device, dtype=torch.float32)
+    mask_test = torch.tensor(test_mask, device=device, dtype=torch.float32)
+    
+    # Convert mean dan std ke GPU tensor untuk operasi selanjutnya
+    mean_X_gpu = torch.tensor(mean_X, device=device, dtype=torch.float32)
+    std_X_gpu = torch.tensor(std_X, device=device, dtype=torch.float32)
 
     MAEs = []
     RMSEs = []
+    ACCs = []
 
     MAEs_out = []
     RMSEs_out = []
+    ACCs_out = []
 
     start_time = time.time()
     for iteration in range(args.max_iter):
@@ -78,26 +84,45 @@ if __name__ == '__main__':
         ## M-Step: Density Estimation
      
         ckpt_dir = f'ckpt/{dataname}/rate{ratio}/{mask_type}/{split_idx}/{num_trials}_{num_steps}'
-        os.makedirs(f'{ckpt_dir}/{iteration}') if not os.path.exists(f'{ckpt_dir}/{iteration}') else None
+        os.makedirs(f'{ckpt_dir}/{iteration}', exist_ok=True)
 
         print(f'iteration: {iteration}')
         print(ckpt_dir)
 
         if iteration == 0:
-            X_miss = (1. - mask_train.float()) * X
-            # Gunakan TensorDataset agar data tetap di GPU (num_workers=0 wajib)
-            train_data = TensorDataset(X_miss)
+            X_miss = (1. - mask_train) * X
+            train_data = X_miss
         else:
             print(f'Loading X_miss from {ckpt_dir}/iter_{iteration}.npy')
-            X_miss = torch.tensor(np.load(f'{ckpt_dir}/iter_{iteration}.npy') / 2, device=device)
-            train_data = TensorDataset(X_miss)
- 
+            # Load langsung ke GPU
+            X_miss = torch.tensor(np.load(f'{ckpt_dir}/iter_{iteration}.npy') / 2, device=device, dtype=torch.float32)
+            train_data = X_miss
+
+        print(f'[INFO] Loaded X_miss shape: {train_data.shape}, range: [{train_data.min():.4f}, {train_data.max():.4f}]')
+
         batch_size = 4096
+        
+        # Buat generator untuk GPU
+        generator = torch.Generator(device=device)
+        
+        # Custom Dataset untuk GPU tensor
+        class GPUTensorDataset(torch.utils.data.Dataset):
+            def __init__(self, data):
+                self.data = data
+            
+            def __len__(self):
+                return len(self.data)
+            
+            def __getitem__(self, idx):
+                return self.data[idx]
+        
         train_loader = DataLoader(
-            train_data,
-            batch_size = batch_size,
-            shuffle = True,
-            num_workers = 0,  # harus 0 karena data sudah di GPU
+            GPUTensorDataset(train_data),
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=0,  # Set 0 karena data sudah di GPU
+            pin_memory=False,  # Tidak perlu pin_memory karena sudah di GPU
+            generator=generator  # Gunakan GPU generator
         )
 
         num_epochs = 10000 + 1
@@ -107,7 +132,7 @@ if __name__ == '__main__':
         if iteration == 0:
             print(denoise_fn)
 
-        model = Model(denoise_fn = denoise_fn, hid_dim = in_dim).to(device)
+        model = Model(denoise_fn=denoise_fn, hid_dim=in_dim).to(device)
 
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=0)
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=50, verbose=False)
@@ -124,8 +149,8 @@ if __name__ == '__main__':
             batch_loss = 0.0
             len_input = 0
  
-            for (batch,) in train_loader:
-                inputs = batch.float()  # sudah di GPU, tidak perlu .to(device)
+            for batch in train_loader:
+                inputs = batch.float()  # Sudah di GPU, tidak perlu .to(device)
                 loss = model(inputs)
 
                 loss = loss.mean()
@@ -155,25 +180,28 @@ if __name__ == '__main__':
                 torch.save(model.state_dict(), f'{ckpt_dir}/{iteration}/model_{epoch}.pt')
 
         end_time = time.time()
+        
+        print(f'Iteration {iteration} training time: {end_time - start_time:.2f} seconds')
 
-    ## E-Step: Missing Value Imputation
+        ## E-Step: Missing Value Imputation
 
         # In-sample imputation
+        
+        impute_start_time = time.time()
 
         rec_Xs = []
 
         for trial in tqdm(range(num_trials), desc='In-sample imputation'):
         
-            X_miss = (1. - mask_train.float()) * X
-            X_miss = X_miss.to(device)
-            impute_X = X_miss
+            X_miss = (1. - mask_train) * X
+            impute_X = X_miss  # Sudah di GPU
   
             in_dim = X.shape[1]
 
             denoise_fn = MLPDiffusion(in_dim, hid_dim).to(device)
 
-            model = Model(denoise_fn = denoise_fn, hid_dim = in_dim).to(device)
-            model.load_state_dict(torch.load(f'{ckpt_dir}/{iteration}/model.pt', map_location=device))
+            model = Model(denoise_fn=denoise_fn, hid_dim=in_dim).to(device)
+            model.load_state_dict(torch.load(f'{ckpt_dir}/{iteration}/model.pt'))
 
             # ==========================================================
 
@@ -182,35 +210,45 @@ if __name__ == '__main__':
             num_samples, dim = X.shape[0], X.shape[1]
             rec_X = impute_mask(net, impute_X, mask_train, num_samples, dim, num_steps, device)
             
-            mask_int = mask_train.to(torch.float).to(device)
-            rec_X = rec_X * mask_int + impute_X * (1-mask_int)
+            mask_int = mask_train.float()  # Sudah di GPU
+            rec_X = rec_X * mask_int + impute_X * (1 - mask_int)
             rec_Xs.append(rec_X)
             
+            
 
-        rec_X = torch.stack(rec_Xs, dim = 0).mean(0) 
+        rec_X = torch.stack(rec_Xs, dim=0).mean(0) 
 
-        # .cpu().numpy() hanya untuk np.save — tidak bisa dihindari
-        rec_X_np = rec_X.cpu().numpy() * 2
-        X_true_np = X.cpu().numpy() * 2
+        # Simpan hasil (hanya saat save ke disk yang perlu CPU)
+        rec_X_save = (rec_X * 2).cpu().numpy()
+        X_true_save = (X * 2).cpu().numpy()
 
-        np.save(f'{ckpt_dir}/iter_{iteration+1}.npy', rec_X_np)
+        np.save(f'{ckpt_dir}/iter_{iteration+1}.npy', rec_X_save)
 
-        # De-normalisasi dan slice di GPU
-        pred_X = rec_X * 2
+        # Lakukan komputasi di GPU
+        pred_X_gpu = rec_X * 2
+        X_true_gpu = X * 2
+
+        # Denormalisasi di GPU
         len_num = train_num.shape[1]
-        res = pred_X[:, len_num:] * std_X[len_num:] + mean_X[len_num:]
-        pred_X = torch.cat([pred_X[:, :len_num], res], dim=1)
+        pred_X_gpu[:, len_num:] = pred_X_gpu[:, len_num:] * std_X_gpu[len_num:] + mean_X_gpu[len_num:]
 
-        X_true = X * 2  # tetap di GPU
+        # Convert ke CPU hanya untuk evaluasi
+        pred_X = pred_X_gpu.cpu().numpy()
+        X_true = X_true_gpu.cpu().numpy()
 
-        mae, rmse = get_eval(dataname, pred_X, X_true, train_cat_idx, train_num.shape[1], cat_bin_num, ori_train_mask)
+        mae, rmse, acc = get_eval(dataname, pred_X, X_true, train_cat_idx, train_num.shape[1], cat_bin_num, ori_train_mask)
         MAEs.append(mae)
         RMSEs.append(rmse)
+        ACCs.append(acc)
+        
+        impute_end_time = time.time()
+        print(f'In-sample imputation time: {impute_end_time - impute_start_time:.2f} seconds')
 
+        print('in-sample', mae, rmse, acc)
 
-        print('in-sample',mae, rmse)
-
-        # out-of_sample_imputation
+        # out-of-sample imputation
+        
+        oos_impute_start_time = time.time()
 
         rec_Xs = []
 
@@ -218,16 +256,15 @@ if __name__ == '__main__':
             
             # For out-of-sample imputation, no results from previous iterations are used
 
-            X_miss = (1. - mask_test.float()) * X_test
-            X_miss = X_miss.to(device)
-            impute_X = X_miss
+            X_miss = (1. - mask_test) * X_test
+            impute_X = X_miss  # Sudah di GPU
 
             in_dim = X_test.shape[1]
 
             denoise_fn = MLPDiffusion(in_dim, hid_dim).to(device)
 
-            model = Model(denoise_fn = denoise_fn, hid_dim = in_dim).to(device)
-            model.load_state_dict(torch.load(f'{ckpt_dir}/{iteration}/model.pt', map_location=device))
+            model = Model(denoise_fn=denoise_fn, hid_dim=in_dim).to(device)
+            model.load_state_dict(torch.load(f'{ckpt_dir}/{iteration}/model.pt'))
 
             # ==========================================================
             net = model.denoise_fn_D
@@ -235,33 +272,45 @@ if __name__ == '__main__':
             num_samples, dim = X_test.shape[0], X_test.shape[1]
             rec_X = impute_mask(net, impute_X, mask_test, num_samples, dim, num_steps, device)
             
-            mask_int = mask_test.to(torch.float).to(device)
-            rec_X = rec_X * mask_int + impute_X * (1-mask_int)
+            mask_int = mask_test.float()  # Sudah di GPU
+            rec_X = rec_X * mask_int + impute_X * (1 - mask_int)
             rec_Xs.append(rec_X)
             
+    
+        rec_X = torch.stack(rec_Xs, dim=0).mean(0) 
 
-        rec_X = torch.stack(rec_Xs, dim = 0).mean(0) 
+        # Lakukan komputasi di GPU
+        pred_X_gpu = rec_X * 2
+        X_true_gpu = X_test * 2
 
-        # De-normalisasi dan slice di GPU
-        pred_X = rec_X * 2
+        # Denormalisasi di GPU
         len_num = train_num.shape[1]
-        res = pred_X[:, len_num:] * std_X[len_num:] + mean_X[len_num:]
-        pred_X = torch.cat([pred_X[:, :len_num], res], dim=1)
+        pred_X_gpu[:, len_num:] = pred_X_gpu[:, len_num:] * std_X_gpu[len_num:] + mean_X_gpu[len_num:]
 
-        X_true = X_test * 2  # tetap di GPU
+        # Convert ke CPU hanya untuk evaluasi
+        pred_X = pred_X_gpu.cpu().numpy()
+        X_true = X_true_gpu.cpu().numpy()
 
-        mae_out, rmse_out = get_eval(dataname, pred_X, X_true, test_cat_idx, test_num.shape[1], cat_bin_num, ori_test_mask, oos = True)
+        mae_out, rmse_out, acc_out = get_eval(dataname, pred_X, X_true, test_cat_idx, test_num.shape[1], cat_bin_num, ori_test_mask, oos=True)
         MAEs_out.append(mae_out)
         RMSEs_out.append(rmse_out)
+        ACCs_out.append(acc_out)
+        
+        oos_impute_end_time = time.time()
+        print(f'Out-of-sample imputation time: {oos_impute_end_time - oos_impute_start_time:.2f} seconds')
 
         result_save_path = f'results/{dataname}/rate{ratio}/{mask_type}/{split_idx}/{num_trials}_{num_steps}'
-        os.makedirs(result_save_path) if not os.path.exists(result_save_path) else None
+        os.makedirs(result_save_path, exist_ok=True)
 
-        with open (f'{result_save_path}/result_base.txt', 'a+') as f:
-
+        with open(f'{result_save_path}/result_base.txt', 'a+') as f:
             f.write(f'iteration {iteration}, MAE: in-sample: {mae}, out-of-sample: {mae_out} \n')
             f.write(f'iteration {iteration}: RMSE: in-sample: {rmse}, out-of-sample: {rmse_out} \n')
+            f.write(f'iteration {iteration}: ACC: in-sample: {acc}, out-of-sample: {acc_out} \n')
+            f.write(f'iteration {iteration}: Training time: {end_time - start_time:.2f}s, In-sample imputation time: {impute_end_time - impute_start_time:.2f}s, Out-of-sample imputation time: {oos_impute_end_time - oos_impute_start_time:.2f}s \n\n')
 
-        print('out-of-sample', mae_out, rmse_out)
+        print('out-of-sample', mae_out, rmse_out, acc_out)
 
         print(f'saving results to {result_save_path}')
+        
+        # Reset start_time untuk iterasi berikutnya
+        start_time = time.time()
