@@ -321,6 +321,7 @@ class SupervisedLearnableEmbeddingModel(nn.Module):
         self.n_classes     = n_classes
         self.noise_std     = noise_std
         self.use_mlp       = use_mlp
+        print(noise_std)
 
         if use_mlp:
             hidden_dim_mlp = max(self.total_emb_dim, int(self.total_emb_dim * mlp_ratio))
@@ -418,6 +419,7 @@ def train_supervised_embedding_model(cat_idx_array: np.ndarray,
     [TIDAK BERUBAH] — sama persis dengan versi sebelumnya.
     Sekarang cat_idx_array berisi SEMUA kolom (numerik bin + kategorikal).
     """
+    print(noise_std)
     model = SupervisedLearnableEmbeddingModel(
         cat_dims, emb_sizes, n_classes,
         dropout=dropout,
