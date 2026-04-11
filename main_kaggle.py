@@ -142,8 +142,8 @@ if __name__ == '__main__':
         #  [TIDAK BERUBAH] — algoritma diffusion sama persis.
         # =====================================================================
 
-        ckpt_dir = (f'/kaggle/working/ckpt/{dataname}/rate{ratio}/{mask_type}/'
-            f'{split_idx}/{num_trials}_{num_steps}')
+        ckpt_dir = (f'ckpt/{dataname}/rate{ratio}/{mask_type}/'
+                    f'{split_idx}/{num_trials}_{num_steps}')
         os.makedirs(f'{ckpt_dir}/{iteration}', exist_ok=True)
 
         print(f'\n{"="*60}')
