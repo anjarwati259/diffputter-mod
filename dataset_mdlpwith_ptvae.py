@@ -7,6 +7,7 @@ from torch.utils.data import Dataset
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 import os
 import json
+import time
 from scipy.stats import chi2
 
 DATA_DIR = 'datasets'
@@ -1241,6 +1242,8 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
     mdlp              : MDLPDiscretizer  (atau None jika tidak ada fitur numerik)
     bin_midpoints     : list[n_num_cols] of np.ndarray  (atau None)
     n_num_cols        : int
+    t_mdlp            : float — waktu komputasi MDLP discretization (detik)
+    t_emb             : float — waktu komputasi embedding training (detik)
     """
     ratio = str(ratio)
 
@@ -1311,19 +1314,23 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
         train_num = train_num_norm.astype(np.float32)
         test_num  = test_num_norm.astype(np.float32)
 
-        # ── MDLP Discretization (TIDAK BERUBAH) ──────────────────────────
+        # ── MDLP Discretization ──────────────────────────────────────────
         print(f'[MDLP] Menjalankan MDLP discretization pada {n_num_cols} kolom numerik ...')
         mdlp = MDLPDiscretizer(min_samples=3)
 
+        t_mdlp_start = time.time()
         mdlp.fit(train_num_raw, train_labels)
 
         train_num_bin = mdlp.transform(train_num_raw)
         test_num_bin  = mdlp.transform(test_num_raw)
 
         bin_midpoints = mdlp.get_bin_midpoints(train_num_norm, train_num_bin)
+        t_mdlp_end = time.time()
+        t_mdlp = t_mdlp_end - t_mdlp_start
 
         print(f'[MDLP] n_bins per kolom: {mdlp.n_bins_}')
         print(f'[MDLP] Total bins: {sum(mdlp.n_bins_)}')
+        print(f'[MDLP] Waktu komputasi diskritisasi: {t_mdlp:.4f}s')
 
     else:
         train_num     = np.zeros((len(train_df), 0), dtype=np.float32)
@@ -1332,6 +1339,7 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
         test_num_bin  = np.zeros((len(test_df),  0), dtype=np.int64)
         bin_midpoints = []
         mdlp          = None
+        t_mdlp        = 0.0
 
     # ── Encoding kolom kategorikal (TIDAK BERUBAH) ────────────────────────
     cat_dims_cat           = []
@@ -1389,6 +1397,7 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
     print('[PT-VAE Embedding] Melatih PTVAEEmbeddingModel '
           '(ELBO: Reconstruction + KL Divergence + Classification loss) ...')
     print('[PT-VAE Embedding] Referensi: Liu et al. (2025) PT-VAE: Variational Autoencoder with Prior Concept Transformation')
+    t_emb_start = time.time()
     emb_model = train_vae_embedding_model(
         cat_idx_array = train_all_idx,
         labels        = train_labels,
@@ -1405,7 +1414,10 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
         encoder_ratio = 1.5,
         patience      = 40,
     )
+    t_emb_end = time.time()
+    t_emb = t_emb_end - t_emb_start
     print('[PT-VAE Embedding] Training selesai. Parameter di-freeze untuk diffusion.')
+    print(f'[PT-VAE Embedding] Waktu komputasi embedding: {t_emb:.4f}s')
 
     # ── Encode semua kolom → embedding vector (z = mu, deterministik) ────
     train_all_emb = encode_with_embedding(emb_model, train_all_idx, device)
@@ -1461,7 +1473,9 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
             emb_sizes,
             mdlp,          # MDLPDiscretizer
             bin_midpoints, # list[n_num_cols] midpoint per bin, skala norm
-            n_num_cols)    # jumlah kolom numerik
+            n_num_cols,    # jumlah kolom numerik
+            t_mdlp,        # waktu komputasi MDLP discretization (detik)
+            t_emb)         # waktu komputasi embedding training (detik)
 
 
 def mean_std(data, mask):

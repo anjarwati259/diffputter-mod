@@ -31,6 +31,7 @@ parser.add_argument('--num_steps',  type=int, default=50,           help='Number
 parser.add_argument('--noise_std',  type=float, default=0.01,       help='Noise std for embedding model.')
 parser.add_argument('--epochs',     type=int, default=10,        help='Number of training epochs per iteration.')
 parser.add_argument('--resume_iter',type=int, default=0,            help='Resume from this iteration index.')
+parser.add_argument('--stop_iter',  type=int, default=None,         help='Stop after this iteration (exclusive). Jika None, jalan sampai max_iter.')
 
 args = parser.parse_args()
 
@@ -77,10 +78,20 @@ if __name__ == '__main__':
      cat_bin_num,
      emb_model,
      emb_sizes,
-     mdlp,           # [BARU] MDLPDiscretizer (atau None jika tidak ada numerik)
-     bin_midpoints,  # [BARU] list[n_num_cols] midpoint per bin, skala normalisasi
-     n_num_cols      # [BARU] jumlah kolom numerik
+     mdlp,           # MDLPDiscretizer (atau None jika tidak ada numerik)
+     bin_midpoints,  # list[n_num_cols] midpoint per bin, skala normalisasi
+     n_num_cols,     # jumlah kolom numerik
+     t_mdlp,         # waktu komputasi MDLP discretization (detik)
+     t_emb           # waktu komputasi embedding training (detik)
      ) = load_dataset(dataname, split_idx, mask_type, ratio, args.noise_std)
+
+    t_total_preprocessing = t_mdlp + t_emb
+    print(f'\n{"="*60}')
+    print(f'[TIMING] Ringkasan Waktu Komputasi Preprocessing:')
+    print(f'  - MDLP Discretization : {t_mdlp:.4f}s')
+    print(f'  - Embedding Training  : {t_emb:.4f}s')
+    print(f'  - Total (Diskrit\u2192Emb) : {t_total_preprocessing:.4f}s')
+    print(f'{"="*60}')
 
     # Setelah load_dataset selesai, aktifkan default device ke CUDA.
     torch.set_default_device(device)
@@ -120,9 +131,15 @@ if __name__ == '__main__':
     MAEs,  RMSEs,  ACCs  = [], [], []
     MAEs_out, RMSEs_out, ACCs_out = [], [], []
 
+    # Tentukan batas iterasi untuk run ini
+    iter_end = args.stop_iter if args.stop_iter is not None else args.max_iter
+    iter_end = min(iter_end, args.max_iter)
+    print(f'[INFO] Menjalankan iterasi {args.resume_iter} s/d {iter_end - 1} '
+          f'(max_iter={args.max_iter})')
+
     start_time = time.time()
 
-    for iteration in range(args.resume_iter, args.max_iter):
+    for iteration in range(args.resume_iter, iter_end):
 
         # =====================================================================
         #  Resume: load rec_X dari iterasi sebelumnya jika resume_iter > 0
@@ -269,17 +286,6 @@ if __name__ == '__main__':
         np.save(f'{ckpt_dir}/iter_{iteration+1}.npy',
                 (rec_X * 2).cpu().numpy())
 
-        # ── Kaggle: simpan iter state permanen ke /kaggle/working ─────────
-        kaggle_ckpt_dir = f'/kaggle/working/ckpt/{dataname}/rate{ratio}/{mask_type}/{split_idx}/{num_trials}_{num_steps}'
-        os.makedirs(kaggle_ckpt_dir, exist_ok=True)
-        np.save(f'{kaggle_ckpt_dir}/iter_{iteration+1}.npy',
-                (rec_X * 2).cpu().numpy())
-        torch.save({
-            'iteration':       iteration,
-            'model_state':     model.state_dict(),
-            'optimizer_state': optimizer.state_dict(),
-        }, f'{kaggle_ckpt_dir}/iter_{iteration}_state.pt')
-
         # =====================================================================
         #  Denormalisasi In-sample
         #
@@ -406,7 +412,20 @@ if __name__ == '__main__':
                             f'{split_idx}/{num_trials}_{num_steps}')
         os.makedirs(result_save_path, exist_ok=True)
 
-        with open(f'{result_save_path}/result_mdlpwith2.txt', 'a+') as f:
+        t_train          = end_time - start_time
+        t_impute_in      = impute_end_time - impute_start_time
+        t_impute_out     = oos_end - oos_start
+        t_total_pipeline = t_mdlp + t_emb + t_train + t_impute_in + t_impute_out
+
+        print(f'\n[TIMING] Iteration {iteration} — Ringkasan Waktu:')
+        print(f'  - MDLP Discretization         : {t_mdlp:.4f}s')
+        print(f'  - Embedding Training           : {t_emb:.4f}s')
+        print(f'  - Diffusion Training           : {t_train:.4f}s')
+        print(f'  - In-sample Imputation         : {t_impute_in:.4f}s')
+        print(f'  - Out-of-sample Imputation     : {t_impute_out:.4f}s')
+        print(f'  - TOTAL (Diskrit→Imputasi)     : {t_total_pipeline:.4f}s')
+
+        with open(f'{result_save_path}/result_mdlpwith_ptvae.txt', 'a+', encoding='utf-8') as f:
             f.write(
                 f'iteration {iteration}, '
                 f'MAE: in-sample={mae:.6f}, out-of-sample={mae_out:.6f}\n'
@@ -421,16 +440,37 @@ if __name__ == '__main__':
             )
             f.write(
                 f'iteration {iteration}, '
-                f'Training time={end_time - start_time:.2f}s, '
-                f'In-sample imputation={impute_end_time - impute_start_time:.2f}s, '
-                f'Out-of-sample imputation={oos_end - oos_start:.2f}s\n\n'
+                f'Training time={t_train:.4f}s, '
+                f'In-sample imputation={t_impute_in:.4f}s, '
+                f'Out-of-sample imputation={t_impute_out:.4f}s\n'
+            )
+            f.write(
+                f'iteration {iteration}, '
+                f'MDLP discretization={t_mdlp:.4f}s, '
+                f'Embedding training={t_emb:.4f}s, '
+                f'Total preprocessing (Diskrit+Emb)={t_mdlp + t_emb:.4f}s\n'
+            )
+            f.write(
+                f'iteration {iteration}, '
+                f'TOTAL pipeline (Diskrit-Imputasi)={t_total_pipeline:.4f}s\n\n'
             )
 
         print(f'Results saved to {result_save_path}')
 
-        # ── Kaggle: copy hasil ke /kaggle/working ─────────────────────────
-        if os.path.exists('results'):
-            shutil.copytree('results', '/kaggle/working/results', dirs_exist_ok=True)
-
         # Reset timer untuk iterasi berikutnya
         start_time = time.time()
+
+    # =========================================================================
+    #  Selesai — reminder resume berikutnya
+    # =========================================================================
+    next_iter = iter_end
+    if next_iter < args.max_iter:
+        print(f'\n{"="*60}')
+        print(f'[STOP] Run selesai sampai iterasi {iter_end - 1}.')
+        print(f'[NEXT] Lakukan Save Version (Run All), lalu lanjut dengan:')
+        print(f'       --resume_iter {next_iter} --stop_iter {min(next_iter + (iter_end - args.resume_iter), args.max_iter)}')
+        print(f'{"="*60}')
+    else:
+        print(f'\n{"="*60}')
+        print(f'[DONE] Semua {args.max_iter} iterasi selesai.')
+        print(f'{"="*60}')
