@@ -21,12 +21,16 @@ parser = argparse.ArgumentParser(description='Missing Value Imputation')
 parser.add_argument('--dataname',   type=str, default='california', help='Name of dataset.')
 parser.add_argument('--gpu',        type=int, default=0,            help='GPU index.')
 parser.add_argument('--split_idx',  type=int, default=0,            help='Split idx.')
-parser.add_argument('--max_iter',   type=int, default=10,            help='Maximum iteration.')
+parser.add_argument('--max_iter',   type=int, default=1,            help='Maximum iteration.')
 parser.add_argument('--ratio',      type=str, default=30,           help='Masking ratio.')
 parser.add_argument('--hid_dim',    type=int, default=1024,         help='Hidden dimension.')
 parser.add_argument('--mask',       type=str, default='MCAR',       help='Masking mechanism.')
-parser.add_argument('--num_trials', type=int, default=20,            help='Number of sampling times.')
+parser.add_argument('--num_trials', type=int, default=1,            help='Number of sampling times.')
 parser.add_argument('--num_steps',  type=int, default=50,           help='Number of diffusion steps.')
+parser.add_argument('--noise_std',  type=float, default=0.05,       help='Noise std for embedding model.')
+parser.add_argument('--epochs',     type=int, default=10,        help='Number of training epochs per iteration.')
+parser.add_argument('--resume_iter',type=int, default=0,            help='Resume from this iteration index.')
+parser.add_argument('--stop_iter',  type=int, default=None,         help='Stop after this iteration (exclusive). Jika None, jalan sampai max_iter.')
 
 args = parser.parse_args()
 
@@ -78,7 +82,7 @@ if __name__ == '__main__':
      n_num_cols,     # [BARU] jumlah kolom numerik
      t_mdlp,         # [BARU] waktu komputasi MDLP discretization (detik)
      t_emb           # [BARU] waktu komputasi embedding training (detik)
-     ) = load_dataset(dataname, split_idx, mask_type, ratio)
+     ) = load_dataset(dataname, split_idx, mask_type, ratio, args.noise_std)
 
     t_total_preprocessing = t_mdlp + t_emb
     print(f'\n{"="*60}')
@@ -126,9 +130,15 @@ if __name__ == '__main__':
     MAEs,  RMSEs,  ACCs  = [], [], []
     MAEs_out, RMSEs_out, ACCs_out = [], [], []
 
+    # Tentukan batas iterasi untuk run ini
+    iter_end = args.stop_iter if args.stop_iter is not None else args.max_iter
+    iter_end = min(iter_end, args.max_iter)
+    print(f'[INFO] Menjalankan iterasi {args.resume_iter} s/d {iter_end - 1} '
+          f'(max_iter={args.max_iter})')
+
     start_time = time.time()
 
-    for iteration in range(args.max_iter):
+    for iteration in range(args.resume_iter, iter_end):
 
         # =====================================================================
         #  M-Step: Density Estimation (DiffPutter)
@@ -179,7 +189,7 @@ if __name__ == '__main__':
             generator   = generator,
         )
 
-        num_epochs  = 10000 + 1
+        num_epochs  = args.epochs + 1
         denoise_fn  = MLPDiffusion(in_dim, hid_dim).to(device)
 
         if iteration == 0:
@@ -442,3 +452,18 @@ if __name__ == '__main__':
 
         # Reset timer untuk iterasi berikutnya
         start_time = time.time()
+
+    # =========================================================================
+    #  Selesai — reminder resume berikutnya
+    # =========================================================================
+    next_iter = iter_end
+    if next_iter < args.max_iter:
+        print(f'\n{"="*60}')
+        print(f'[STOP] Run selesai sampai iterasi {iter_end - 1}.')
+        print(f'[NEXT] Lakukan Save Version (Run All), lalu lanjut dengan:')
+        print(f'       --resume_iter {next_iter} --stop_iter {min(next_iter + (iter_end - args.resume_iter), args.max_iter)}')
+        print(f'{"="*60}')
+    else:
+        print(f'\n{"="*60}')
+        print(f'[DONE] Semua {args.max_iter} iterasi selesai.')
+        print(f'{"="*60}')

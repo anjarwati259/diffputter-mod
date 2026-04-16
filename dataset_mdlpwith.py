@@ -659,7 +659,7 @@ def decode_num_from_embedding(model: SupervisedLearnableEmbeddingModel,
 #  Load Dataset
 # ===========================================================================
 
-def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30'):
+def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
     """
     Load dataset dengan MDLP discretization untuk numerik +
     Supervised Embedding untuk SEMUA kolom (numerik-bin + kategorikal).
@@ -859,6 +859,7 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30'):
     print('[Embedding] Melatih SupervisedLearnableEmbeddingModel '
           '(classification + reconstruction loss) ...')
     t_emb_start = time.time()
+    print(noise_std)
     emb_model = train_supervised_embedding_model(
         cat_idx_array = train_all_idx,
         labels        = train_labels,
@@ -873,7 +874,7 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30'):
         hidden_dim    = 256,
         use_mlp       = True,
         mlp_ratio     = 1.5,
-        noise_std     = 0.01,
+        noise_std     = noise_std,
         patience      = 40,
     )
     t_emb_end = time.time()
