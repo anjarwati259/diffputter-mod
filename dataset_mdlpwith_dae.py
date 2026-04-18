@@ -547,29 +547,41 @@ class DAEEmbeddingModel(nn.Module):
         """
         g_θ': representasi laten y → logits rekonstruksi per kolom.
 
-        Mengimplementasikan persamaan (Section 2.2 paper):
-            z = g_θ'(y) = sigmoid(W'y + b')
+        PERBAIKAN (konsisten dengan Vincent et al. 2008 + CrossEntropyLoss):
+        ─────────────────────────────────────────────────────────────────────
+        Untuk fitur multi-class (one-hot per kolom), setiap kolom harus
+        diperlakukan sebagai distribusi kategoris — bukan biner independen.
 
-        Kemudian z [batch, total_onehot] di-slice per kolom menjadi logits
-        untuk cross-entropy loss (eq. 5).
+        Arsitektur decoder mengikuti paper (Section 2.2):
+            z_raw = W'y + b'   ← affine projection (RAW, tanpa aktivasi)
+        Kemudian z_raw di-slice per kolom:
+            logits_j = z_raw[:, offset_j : offset_j + vocab_j]  [batch, vocab_j]
+
+        CrossEntropyLoss (dipakai di training) sudah mengandung softmax internal,
+        sehingga TIDAK perlu sigmoid/softmax di sini.
+
+        Untuk argmax (prediksi kelas): argmax(logits_j) — benar karena
+            argmax(softmax(logits)) = argmax(logits)
+
+        Untuk decode numerik (weighted-sum): softmax(logits_j) @ midpoints — benar.
+
+        Catatan: tied_weights (W' = W^T) tetap didukung, namun tanpa sigmoid.
 
         y      : [batch, hidden_dim]
-        return : list[n_cols] of [batch, vocab_size_i]
+        return : list[n_cols] of [batch, vocab_size_i]  — RAW logits
         """
         if self.tied_weights:
-            # W' = W^T  (tied weights, Section 2.2)
-            z_logits = torch.sigmoid(
-                torch.nn.functional.linear(y, self.W_enc.weight.t(), self.b_dec)
-            )
+            # W' = W^T  (tied weights, Section 2.2) — tanpa sigmoid
+            z_raw = torch.nn.functional.linear(y, self.W_enc.weight.t(), self.b_dec)
         else:
-            z_logits = torch.sigmoid(self.W_dec(y))  # [batch, total_onehot]
+            z_raw = self.W_dec(y)  # [batch, total_onehot] — RAW logits
 
-        # Slice per kolom → logits rekonstruksi
+        # Slice per kolom → logits rekonstruksi (RAW, tanpa aktivasi)
         logits_per_col = []
         for i, n_cat in enumerate(self.cat_dims):
             start = self._col_offsets[i]
             end   = start + n_cat
-            logits_per_col.append(z_logits[:, start:end])   # [batch, vocab_size_i]
+            logits_per_col.append(z_raw[:, start:end])   # [batch, vocab_size_i]
 
         return logits_per_col
 
@@ -679,10 +691,18 @@ def train_dae_embedding_model(cat_idx_array: np.ndarray,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    # Loss L_H: cross-entropy rekonstruksi per elemen one-hot (eq. 2 paper)
-    # LH(x, z) = -Σ_k [ x_k log z_k + (1-x_k) log(1-z_k) ]
-    # Karena decoder mengeluarkan sigmoid → BCELoss (bukan CrossEntropyLoss)
-    bce_loss  = nn.BCELoss()
+    # Loss L_H: cross-entropy rekonstruksi per kolom (eq. 2 & 5 paper)
+    #
+    # PERBAIKAN: Gunakan CrossEntropyLoss per kolom, BUKAN sigmoid + BCELoss.
+    #
+    # Setiap kolom merepresentasikan variabel kategoris one-of-K.
+    # CrossEntropyLoss(logits [B, K], target [B]) = -log softmax(logits)[target]
+    # ini benar untuk distribusi kategoris karena mengandung softmax internal
+    # dan menjamin ΣP = 1 per kolom.
+    #
+    # sigmoid + BCE salah karena memperlakukan tiap bit secara independen
+    # sehingga tidak ada normalisasi across vocab per kolom.
+    ce_loss = nn.CrossEntropyLoss()
 
     # Hanya butuh x_clean — tidak butuh label
     cat_tensor = torch.tensor(cat_idx_array, dtype=torch.long, device=device)
@@ -716,17 +736,20 @@ def train_dae_embedding_model(cat_idx_array: np.ndarray,
             # Corruption dilakukan DI DALAM model.forward() (hanya saat training)
             y, _, recon_logits = model(batch_cat)
 
-            # Loss L_H sesuai eq. 2 & 5 Vincent et al. (2008):
-            #   LH(x, z) = -Σ_k [x_k log z_k + (1-x_k) log(1-z_k)]
-            # recon_logits[i]: [batch, vocab_size_i] — output sigmoid decoder
-            # target_oh[i]   : [batch, vocab_size_i] — one-hot dari x_clean asli
+            # Loss sesuai eq. 2 & 5 Vincent et al. (2008) — per kolom:
+            #   CE(logits_j [B, K], target_j [B]) untuk setiap kolom j
+            #
+            # PERBAIKAN: target adalah integer index (bukan one-hot float)
+            # CrossEntropyLoss menerima: logits [B, K] dan target [B] (int)
+            # Ini menggantikan: one-hot scatter + BCELoss (yang salah untuk multi-class)
             recon_loss = 0.0
-            for i, n_cat in enumerate(model.cat_dims):
-                # Buat target one-hot dari integer index bersih
-                target_oh = torch.zeros(batch_cat.shape[0], n_cat,
-                                        device=device, dtype=torch.float32)
-                target_oh.scatter_(1, batch_cat[:, i].unsqueeze(1), 1.0)
-                recon_loss = recon_loss + bce_loss(recon_logits[i], target_oh)
+            for i in range(model.n_cols):
+                # logits_i : [batch, vocab_size_i]  — RAW logits dari decoder
+                # target_i : [batch]                — integer class index
+                recon_loss = recon_loss + ce_loss(
+                    recon_logits[i],          # [B, K] raw logits
+                    batch_cat[:, i].long()    # [B]    integer target
+                )
             recon_loss = recon_loss / model.n_cols
 
             recon_loss.backward()
@@ -738,8 +761,20 @@ def train_dae_embedding_model(cat_idx_array: np.ndarray,
         avg_loss = total_recon_loss / n_batches
 
         if (epoch + 1) % 10 == 0:
+            # Hitung reconstruction accuracy (denoising) pada batch terakhir
+            # untuk monitoring kemampuan model merekonstruksi x dari x_tilde
+            with torch.no_grad():
+                correct_total = 0
+                total_cols    = 0
+                for i in range(model.n_cols):
+                    pred_i = recon_logits[i].argmax(dim=1)   # argmax(raw_logits) = argmax(softmax)
+                    true_i = batch_cat[:, i].long()
+                    correct_total += (pred_i == true_i).sum().item()
+                    total_cols    += batch_cat.shape[0]
+                recon_acc = correct_total / total_cols if total_cols > 0 else 0.0
             print(f'[DAE] Epoch {epoch+1}/{n_epochs} - '
-                  f'Reconstruction Loss: {avg_loss:.4f}')
+                  f'Reconstruction Loss: {avg_loss:.4f}  '
+                  f'Batch Recon Acc (corrupted→clean): {recon_acc:.4f}')
 
         if avg_loss < best_loss:
             best_loss        = avg_loss
@@ -769,6 +804,20 @@ def train_dae_embedding_model(cat_idx_array: np.ndarray,
         print(f'  mean={z_sample.mean().item():.4f}  '
               f'std={z_sample.std().item():.4f}  '
               f'norm_mean={z_sample.norm(dim=1).mean().item():.4f}')
+
+    # ── Evaluasi denoising pada beberapa corruption level ──────────────────
+    # Ini adalah evaluasi utama DAE sesuai Vincent et al. (2008):
+    #   x_clean → corrupt(ν) → encode → decode → compare x_clean
+    # Memverifikasi bahwa model benar-benar belajar: g(f(x̃)) ≈ x
+    eval_sample = cat_tensor[:min(4096, len(cat_tensor))].cpu().numpy()
+    evaluate_dae_denoising(
+        model            = model,
+        cat_idx_array    = eval_sample,
+        device           = device,
+        corruption_levels= [0.0, 0.1, 0.2, 0.3, 0.5],
+        corruption_type  = corruption_type,
+        verbose          = True,
+    )
 
     for param in model.parameters():
         param.requires_grad_(False)
@@ -805,6 +854,170 @@ def train_supervised_embedding_model(cat_idx_array, labels, cat_dims, emb_sizes,
         noise_std       = noise_std,
         patience        = patience,
     )
+
+
+# ===========================================================================
+#  Evaluasi Kemampuan Denoising (INTI DAE — Vincent et al. 2008)
+#
+#  Mengukur kemampuan model merekonstruksi x_clean dari x_tilde sesuai
+#  objective utama paper (eq. 5):
+#      g(f(x̃)) ≈ x
+#
+#  Pipeline evaluasi yang benar (konsisten dengan training):
+#      x_clean → corrupt(qD) → f_θ → g_θ' → compare dengan x_clean
+#
+#  Dua metrik utama:
+#    1. reconstruction_loss : CE rata-rata per kolom (sama dengan training loss)
+#    2. accuracy_per_feature : akurasi rekonstruksi per kolom
+#
+#  Dilakukan pada berbagai corruption level untuk memverifikasi bahwa
+#  model benar-benar belajar denoising (bukan identity mapping).
+# ===========================================================================
+
+def evaluate_dae_denoising(model: DAEEmbeddingModel,
+                           cat_idx_array: np.ndarray,
+                           device: str,
+                           corruption_levels: list = None,
+                           corruption_type: str = 'mask',
+                           batch_size: int = 4096,
+                           verbose: bool = True) -> dict:
+    """
+    Evaluasi kemampuan denoising DAE sesuai objective Vincent et al. (2008).
+
+    Skenario evaluasi (WAJIB sama dengan training):
+        x_clean → corrupt(ν) → model.encode → model.decode → compare x_clean
+
+    Parameter
+    ---------
+    model           : DAEEmbeddingModel — model sudah dilatih
+    cat_idx_array   : [N, n_cols]  — data bersih (integer index)
+    device          : str
+    corruption_levels : list[float] — beberapa level corruption untuk dibandingkan
+                        Default: [0.0, 0.1, 0.2, 0.3, 0.5]
+                        0.0 = evaluasi dengan input bersih (baseline)
+    corruption_type : str — 'mask' | 'random_replace'
+    verbose         : bool — cetak ringkasan per level
+
+    Return
+    ------
+    dict dengan key = corruption_level (float), value = dict berisi:
+        'reconstruction_loss'  : float — CE loss rata-rata (konsisten dgn training)
+        'overall_accuracy'     : float — akurasi rekonstruksi semua kolom
+        'per_col_accuracy'     : np.ndarray [n_cols] — akurasi per kolom
+        'n_samples'            : int
+    """
+    if corruption_levels is None:
+        corruption_levels = [0.0, 0.1, 0.2, 0.3, 0.5]
+
+    ce_loss_fn = nn.CrossEntropyLoss(reduction='mean')
+    cat_tensor = torch.tensor(cat_idx_array, dtype=torch.long, device=device)
+    n_cols     = model.n_cols
+    results    = {}
+
+    model.eval()
+
+    if verbose:
+        print('\n' + '=' * 65)
+        print(' Evaluasi Denoising DAE — Vincent et al. (2008)')
+        print(' Skenario: x_clean → corrupt(ν) → encode → decode → compare x_clean')
+        print('=' * 65)
+        header = f"{'ν':>6} | {'CE Loss':>10} | {'Overall Acc':>12} | {'Per-Col Acc (min→max)':>28}"
+        print(header)
+        print('-' * 65)
+
+    for nu in corruption_levels:
+        total_ce_loss = 0.0
+        n_batches     = 0
+        col_correct   = np.zeros(n_cols, dtype=np.int64)
+        col_total     = np.zeros(n_cols, dtype=np.int64)
+
+        with torch.no_grad():
+            for start in range(0, len(cat_tensor), batch_size):
+                x_clean = cat_tensor[start : start + batch_size]   # [B, n_cols]
+
+                # ── Step 1: Corrupt x_clean → x_tilde ─────────────────────
+                # Jika ν=0 → x_tilde = x_clean (evaluasi input bersih / baseline)
+                if nu > 0.0:
+                    x_oh    = model._to_onehot(x_clean)             # [B, total_OH]
+                    # Terapkan corruption manual dengan level ν
+                    x_tilde_oh = x_oh.clone()
+                    for col_i, n_cat in enumerate(model.cat_dims):
+                        start_c = model._col_offsets[col_i]
+                        end_c   = start_c + n_cat
+                        col_corrupt = torch.bernoulli(
+                            torch.full((x_clean.shape[0],), nu, device=device)
+                        ).bool()
+                        if not col_corrupt.any():
+                            continue
+                        if corruption_type == 'mask':
+                            x_tilde_oh[col_corrupt, start_c:end_c] = 0.0
+                        elif corruption_type == 'random_replace':
+                            rand_idx = torch.randint(0, n_cat,
+                                                     (int(col_corrupt.sum()),),
+                                                     device=device)
+                            rand_oh = torch.zeros(int(col_corrupt.sum()), n_cat,
+                                                  device=device)
+                            rand_oh.scatter_(1, rand_idx.unsqueeze(1), 1.0)
+                            x_tilde_oh[col_corrupt, start_c:end_c] = rand_oh
+                    # ── Step 2: Encode x_tilde → y ────────────────────────
+                    x_tilde_oh = model.dropout(x_tilde_oh)
+                    y           = torch.sigmoid(model.W_enc(x_tilde_oh))
+                else:
+                    # ν=0: encode langsung x_clean (tanpa corrupt)
+                    y = model.encode(x_clean)
+
+                # ── Step 3: Decode y → recon_logits ───────────────────────
+                recon_logits = model.decode(y)   # list[n_cols] of [B, K_j]
+
+                # ── Step 4: Hitung CE loss & accuracy vs x_clean ──────────
+                batch_ce = 0.0
+                for j in range(n_cols):
+                    logits_j = recon_logits[j]              # [B, K_j] raw logits
+                    target_j = x_clean[:, j].long()         # [B] clean integer index
+
+                    # CE loss konsisten dengan training
+                    batch_ce += ce_loss_fn(logits_j, target_j).item()
+
+                    # Accuracy: argmax(raw logits) = argmax(softmax) — benar
+                    pred_j = logits_j.argmax(dim=1)
+                    col_correct[j] += (pred_j == target_j).sum().item()
+                    col_total[j]   += x_clean.shape[0]
+
+                total_ce_loss += batch_ce / n_cols
+                n_batches     += 1
+
+        avg_ce          = total_ce_loss / n_batches
+        per_col_acc     = col_correct / np.maximum(col_total, 1)
+        overall_acc     = col_correct.sum() / np.maximum(col_total.sum(), 1)
+
+        results[nu] = {
+            'reconstruction_loss' : avg_ce,
+            'overall_accuracy'    : float(overall_acc),
+            'per_col_accuracy'    : per_col_acc,
+            'n_samples'           : int(col_total[0]) if len(col_total) > 0 else 0,
+        }
+
+        if verbose:
+            acc_min = per_col_acc.min() if len(per_col_acc) > 0 else 0.0
+            acc_max = per_col_acc.max() if len(per_col_acc) > 0 else 0.0
+            tag = ' ← training ν' if abs(nu - 0.3) < 1e-6 else (
+                  ' ← baseline'   if nu == 0.0 else '')
+            print(f'{nu:>6.1f} | {avg_ce:>10.4f} | {overall_acc:>12.4f} | '
+                  f'[{acc_min:.3f} → {acc_max:.3f}]{tag}')
+
+    if verbose:
+        print('=' * 65)
+        nu0   = results.get(0.0, {})
+        nu_tr = results.get(0.3, {})
+        if nu0 and nu_tr:
+            acc_drop = nu0['overall_accuracy'] - nu_tr['overall_accuracy']
+            print(f'\nAcc drop bersih (ν=0 → ν=0.3): {acc_drop:+.4f}')
+            print('Interpretasi:')
+            print('  Jika acc(ν=0) >> acc(ν>0): model bergantung pada input bersih')
+            print('  Jika acc(ν=0) ≈ acc(ν>0): model robust — benar-benar belajar denoising')
+        print('')
+
+    return results
 
 
 # ===========================================================================
@@ -848,8 +1061,12 @@ def decode_cat_from_embedding(model: DAEEmbeddingModel,
     Decode representasi laten y → prediksi kelas tiap kolom (argmax logits).
 
     Mengimplementasikan g_θ' dari paper (Section 2.2):
-        z = sigmoid(W'y + b')
+        z_raw = W'y + b'  (RAW logits, tanpa aktivasi)
     kemudian argmax per slice kolom diambil sebagai prediksi kategori.
+
+    PERBAIKAN: Decoder kini mengeluarkan raw logits (bukan sigmoid output).
+    argmax(raw_logits) = argmax(softmax(logits)) — ekuivalen dan benar
+    untuk prediksi kelas kategoris.
 
     emb_array : [N, hidden_dim]  — output encode() / representasi laten y
     Return    : [N, n_cols]      — predicted integer index
@@ -888,11 +1105,17 @@ def decode_num_from_embedding(model: DAEEmbeddingModel,
     Decode representasi laten y → nilai numerik kontinu (skala normalisasi).
 
     Mengimplementasikan g_θ' dari paper (Section 2.2) untuk kolom numerik:
-        z = sigmoid(W'y + b')  →  slice per kolom numerik
-        → softmax → weighted sum atas midpoints bin
+        z_raw = W'y + b'  (RAW logits) → slice per kolom numerik
+        → softmax(z_raw_col) → weighted sum atas midpoints bin
+
+    PERBAIKAN: Decoder kini mengeluarkan raw logits (bukan sigmoid).
+    softmax(raw_logits) benar karena menghasilkan distribusi probabilitas
+    yang valid (ΣP=1) untuk weighted sum atas bin midpoints.
+    Sebelumnya sigmoid(logits) tidak menjamin ΣP=1 sehingga weighted sum
+    tidak memiliki interpretasi probabilistik yang valid.
 
     Alur (Weighted Sum / Soft Decode):
-        y → g_θ'(y) → z_col [N, n_bins] → softmax → weighted sum @ mids
+        y → g_θ'(y) → z_raw_col [N, n_bins] → softmax → weighted sum @ mids
 
     Kolom numerik diasumsikan berada di AWAL (indeks 0..n_num_cols-1).
 
@@ -1271,6 +1494,21 @@ def get_eval(dataname, X_recon, X_true, truth_all_idx,
     """
     Hitung MAE, RMSE (numerik) dan Accuracy (kategorikal).
 
+    CATATAN PENTING — Konsistensi Training vs Evaluasi (Vincent et al. 2008):
+    ──────────────────────────────────────────────────────────────────────────
+    Fungsi ini mengevaluasi hasil rekonstruksi SETELAH pipeline imputasi lengkap
+    (diffusion/downstream). Untuk evaluasi kemampuan denoising DAE secara murni,
+    gunakan fungsi `evaluate_dae_denoising()` yang mengikuti skenario benar:
+        x_clean → corrupt(ν) → encode → decode → compare x_clean
+
+    Fungsi ini (get_eval) memverifikasi kualitas imputasi akhir dengan metrik:
+      - MAE/RMSE di skala normalisasi (untuk fitur numerik)
+      - Accuracy rekonstruksi (untuk fitur kategorikal)
+    pada posisi-posisi yang missing (mask=True).
+
+    PERBAIKAN: decode_cat_from_embedding kini menggunakan argmax(raw_logits)
+    yang benar (setelah decoder diperbaiki dari sigmoid → raw logits).
+
     [MODIFIKASI] Numerik sekarang di-embed bersama kategorikal.
     MAE/RMSE dihitung di skala normalisasi menggunakan ground truth
     nilai asli (bukan midpoint bin) yang dipass via num_true_norm.
@@ -1286,7 +1524,7 @@ def get_eval(dataname, X_recon, X_true, truth_all_idx,
         MAE/RMSE dihitung di skala (X-mean)/std (normalisasi).
 
     Kategorikal (Accuracy):
-        decode_cat_from_embedding → argmax logits → dibandingkan truth_all_idx
+        decode_cat_from_embedding → argmax(raw_logits) → dibandingkan truth_all_idx
         Sama persis dengan versi sebelumnya, hanya offset kolom bergeser
         karena kolom numerik (bin) ada di awal.
 
