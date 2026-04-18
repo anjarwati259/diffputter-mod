@@ -1,0 +1,9 @@
+median in sample MAE: 0.44710761308670044
+median in sample RMSE: 1.0626741647720337
+median in sample acc: 0.503284933473196
+gain in sample MAE: 0.4754233658313751
+gain in sample RMSE: 1.047309160232544
+gain in sample acc: 0.515375697013195
+sklearn_missforest in sample MAE: 0.42648544907569885
+sklearn_missforest in sample RMSE: 0.8859867453575134
+sklearn_missforest in sample acc: 0.5325456854193121

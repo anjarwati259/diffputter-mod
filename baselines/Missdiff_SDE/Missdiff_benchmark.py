@@ -32,17 +32,19 @@ parser.add_argument('--mask_num', type=int, default=10, help='Number of masks.')
 
 args = parser.parse_args()
 
-# check cuda
-if args.gpu != -1 and torch.cuda.is_available():
-    args.device = f'cuda:{args.gpu}'
-else:
-    args.device = 'cpu'
+# check cuda - force GPU usage
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA tidak tersedia! Pastikan GPU sudah terpasang dan driver CUDA sudah terinstall.")
+if args.gpu == -1:
+    args.gpu = 0  # default ke GPU 0 jika tidak dispesifikasi
+args.device = f'cuda:{args.gpu}'
+print(f"Menggunakan GPU: {torch.cuda.get_device_name(args.gpu)} (cuda:{args.gpu})")
 
-datanames = ['bean', 'adult', 'beijing', 'california', 'default', 'gesture', 'letter', 'magic', 'news', 'shoppers'] 
+datanames = ['shoppers'] 
 
 
 if __name__ == '__main__':
-    for mask_type in ['MCAR', 'MAR', 'MNAR']:
+    for mask_type in ['MCAR']:
         dataname = args.dataname
         split_idx = args.split_idx
         device = args.device
@@ -91,18 +93,17 @@ if __name__ == '__main__':
                     print(f'{ckpt_eval_sample}/result_mask{split_idx}.txt exists, skip')
                     continue
                 
-                mean_X = train_X.mean(0)
-                std_X = train_X.std(0)
+                # [GPU] Pindahkan komputasi mean/std dan normalisasi langsung ke GPU
+                mean_X = torch.tensor(train_X.mean(0), dtype=torch.float32).to(device)
+                std_X = torch.tensor(train_X.std(0), dtype=torch.float32).to(device)
                 in_dim = train_X.shape[1]
 
-                X = (train_X - mean_X) / std_X / 2
-                X = torch.tensor(X)
+                X = (torch.tensor(train_X, dtype=torch.float32).to(device) - mean_X) / std_X / 2
+                X_test = (torch.tensor(test_X, dtype=torch.float32).to(device) - mean_X) / std_X / 2
 
-                X_test = (test_X - mean_X) / std_X / 2
-                X_test = torch.tensor(X_test)
-
-                mask_train = torch.tensor(train_mask)
-                mask_test = torch.tensor(test_mask)
+                # [GPU] Pindahkan mask ke GPU
+                mask_train = torch.tensor(train_mask).to(device)
+                mask_test = torch.tensor(test_mask).to(device)
 
                 MAEs = []
                 RMSEs = []
@@ -116,11 +117,12 @@ if __name__ == '__main__':
                 os.makedirs(ckpt_dir) if not os.path.exists(ckpt_dir) else None
                 
                 if init_method == 'zero':
+                    # [GPU] Komputasi X_miss langsung di GPU, ambil ke CPU hanya untuk DataLoader
                     X_miss = (1. - mask_train.float()) * X
-                    train_data = X_miss.numpy()
+                    train_data = X_miss.cpu().numpy()
                 elif init_method == 'mean': 
-                    # use the mean of each column to fill the missing values
-                    X_miss = X.numpy().copy()
+                    # np.nanmean tidak support GPU, proses ini tetap di CPU
+                    X_miss = X.cpu().numpy().copy()
                     X_miss[train_mask] = np.nan
                     mean_ret = np.nanmean(X_miss, axis = 0)
                     # use mean_ret to fill the missing values
@@ -133,7 +135,8 @@ if __name__ == '__main__':
                     train_data = np.load(f'../Remasker_output_new/{mask_type}/filled_X/{dataname}/mask_{split_idx}/train/remasker.npy')    
                      
                 # Combine the data and mask, keep track of missing entities.
-                comb_train_data = np.concatenate([train_data, mask_train.numpy()], axis = 1)
+                # mask_train sudah di GPU, ambil ke CPU untuk numpy concat
+                comb_train_data = np.concatenate([train_data, mask_train.cpu().numpy()], axis = 1)
                 
                 batch_size = 4096
                 train_loader = DataLoader(
@@ -152,7 +155,7 @@ if __name__ == '__main__':
                 model = Model(denoise_fn = denoise_fn, hid_dim = in_dim).to(device)
 
                 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=0)
-                scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=20, verbose=True)
+                scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=20)
 
                 model.train()
 
@@ -205,8 +208,8 @@ if __name__ == '__main__':
 
                 for trial in range(num_trials):
                     
+                    # [GPU] X dan mask_train sudah di GPU, operasi langsung di GPU
                     X_miss = (1. - mask_train.float()) * X
-                    X_miss = X_miss.to(device)
                     impute_X = X_miss
 
                     in_dim = X.shape[1]
@@ -215,7 +218,8 @@ if __name__ == '__main__':
 
                     ckpt_dir = f'ckpt/{dataname}'
                     model = Model(denoise_fn = denoise_fn, hid_dim = in_dim).to(device)
-                    model.load_state_dict(torch.load(f'{ckpt_dir}/{split_idx}/model.pt'))
+                    # [GPU] Load checkpoint langsung ke device GPU
+                    model.load_state_dict(torch.load(f'{ckpt_dir}/{split_idx}/model.pt', map_location=device))
 
                     # ==========================================================
 
@@ -225,7 +229,8 @@ if __name__ == '__main__':
                     num_samples, dim = X.shape[0], X.shape[1]
                     rec_X = impute_mask(net, impute_X, mask_train, num_samples, dim, num_steps, device)
                     
-                    mask_int = mask_train.to(torch.float).to(device)
+                    # [GPU] mask_train sudah di GPU, tidak perlu .to(device) lagi
+                    mask_int = mask_train.to(torch.float)
                     rec_X = rec_X * mask_int + impute_X * (1-mask_int)
                     rec_Xs.append(rec_X)
                     
@@ -240,7 +245,8 @@ if __name__ == '__main__':
 
                 pred_X = rec_X[:]
                 len_num = train_num.shape[1]
-                res = pred_X[:, len_num:] * std_X[len_num:] + mean_X[len_num:]
+                # [GPU] Ambil mean_X dan std_X ke CPU untuk operasi numpy
+                res = pred_X[:, len_num:] * std_X.cpu().numpy()[len_num:] + mean_X.cpu().numpy()[len_num:]
                 pred_X[:, len_num:] = res
 
                 mae, rmse, acc = get_eval(dataname, pred_X, X_true, train_cat_idx, train_num.shape[1], cat_bin_num, ori_train_mask)
@@ -261,8 +267,8 @@ if __name__ == '__main__':
                     
                     # For out-of-sample imputation, no results from previous iterations are used
 
+                    # [GPU] X_test dan mask_test sudah di GPU
                     X_miss = (1. - mask_test.float()) * X_test
-                    X_miss = X_miss.to(device)
                     impute_X = X_miss
 
                     in_dim = X_test.shape[1]
@@ -271,7 +277,8 @@ if __name__ == '__main__':
 
                     ckpt_dir = f'ckpt/{dataname}'
                     model = Model(denoise_fn = denoise_fn, hid_dim = in_dim).to(device)
-                    model.load_state_dict(torch.load(f'{ckpt_dir}/{split_idx}/model.pt'))
+                    # [GPU] Load checkpoint langsung ke device GPU
+                    model.load_state_dict(torch.load(f'{ckpt_dir}/{split_idx}/model.pt', map_location=device))
 
                     # ==========================================================
 
@@ -281,7 +288,8 @@ if __name__ == '__main__':
                     num_samples, dim = X_test.shape[0], X_test.shape[1]
                     rec_X = impute_mask(net, impute_X, mask_test, num_samples, dim, num_steps, device)
                     
-                    mask_int = mask_test.to(torch.float).to(device)
+                    # [GPU] mask_test sudah di GPU, tidak perlu .to(device) lagi
+                    mask_int = mask_test.to(torch.float)
                     rec_X = rec_X * mask_int + impute_X * (1-mask_int)
                     rec_Xs.append(rec_X)
                     
@@ -294,7 +302,8 @@ if __name__ == '__main__':
 
                 pred_X = rec_X[:]
                 len_num = train_num.shape[1]
-                res = pred_X[:, len_num:] * std_X[len_num:] + mean_X[len_num:]
+                # [GPU] Ambil mean_X dan std_X ke CPU untuk operasi numpy
+                res = pred_X[:, len_num:] * std_X.cpu().numpy()[len_num:] + mean_X.cpu().numpy()[len_num:]
                 pred_X[:, len_num:] = res
 
                 mae_out, rmse_out, acc_out = get_eval(dataname, pred_X, X_true, test_cat_idx, test_num.shape[1], cat_bin_num, ori_test_mask)

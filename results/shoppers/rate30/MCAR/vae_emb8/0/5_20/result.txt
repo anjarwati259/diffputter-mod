@@ -1,0 +1,20 @@
+iteration 0, MAE: in-sample: 93.90721893310547, out-of-sample: 98.55048370361328
+iteration 0: RMSE: in-sample: 427.0373840332031, out-of-sample: 530.2844848632812
+iteration 0: ACC: in-sample: 0.539691289966924, out-of-sample: 0.5412108878148054
+iteration 0: TIME_M_SEC: 392.747846, TIME_E_SEC: 133.929365, TIME_TOTAL_SEC: 526.753649
+iteration 1, MAE: in-sample: 87.12207794189453, out-of-sample: 91.68577575683594
+iteration 1: RMSE: in-sample: 435.3918762207031, out-of-sample: 491.00311279296875
+iteration 1: ACC: in-sample: 0.539691289966924, out-of-sample: 0.5412108878148054
+iteration 1: TIME_M_SEC: 439.959677, TIME_E_SEC: 138.546779, TIME_TOTAL_SEC: 578.581166
+iteration 2, MAE: in-sample: 87.21373748779297, out-of-sample: 87.9137191772461
+iteration 2: RMSE: in-sample: 395.8594665527344, out-of-sample: 368.33282470703125
+iteration 2: ACC: in-sample: 0.539691289966924, out-of-sample: 0.5412108878148054
+iteration 2: TIME_M_SEC: 341.894506, TIME_E_SEC: 136.272892, TIME_TOTAL_SEC: 478.244193
+iteration 3, MAE: in-sample: 94.90457153320312, out-of-sample: 104.20733642578125
+iteration 3: RMSE: in-sample: 474.3524475097656, out-of-sample: 535.51708984375
+iteration 3: ACC: in-sample: 0.539691289966924, out-of-sample: 0.5412108878148054
+iteration 3: TIME_M_SEC: 233.999536, TIME_E_SEC: 136.040659, TIME_TOTAL_SEC: 370.115325
+iteration 4, MAE: in-sample: 85.21041107177734, out-of-sample: 86.24969482421875
+iteration 4: RMSE: in-sample: 379.2356262207031, out-of-sample: 359.6337890625
+iteration 4: ACC: in-sample: 0.539691289966924, out-of-sample: 0.5412108878148054
+iteration 4: TIME_M_SEC: 406.313505, TIME_E_SEC: 134.661627, TIME_TOTAL_SEC: 541.064054

@@ -1,0 +1,6 @@
+median in sample MAE: 0.44742509722709656
+median in sample RMSE: 1.0589224100112915
+median in sample acc: 0.5093133166527662
+gain in sample MAE: 0.4665478765964508
+gain in sample RMSE: 1.0457323789596558
+gain in sample acc: 0.509257714762302

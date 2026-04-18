@@ -20,7 +20,7 @@ if args.benchmark_mask_ratio:
 elif args.benchmark_sample_size:
     datanames = ['beijing']
 else:
-    datanames = ['bean', 'adult', 'beijing', 'california', 'default', 'gesture', 'letter', 'magic', 'news', 'shoppers']
+    datanames = ['shoppers']
     
 if args.benchmark_mask_ratio:
     missing_rates = [0.5, 0.7]

@@ -1,0 +1,24 @@
+iteration 0, MAE: in-sample: 0.435407429933548, out-of-sample: 0.43570852279663086
+iteration 0: RMSE: in-sample: 0.9253728985786438, out-of-sample: 0.8778130412101746
+iteration 0: ACC: in-sample: 0.5414002205071665, out-of-sample: 0.5441363520732638
+iteration 0: TIME_M_SEC: 492.175443, TIME_E_SEC: 657.714526, TIME_TOTAL_SEC: 1149.930776
+iteration 1, MAE: in-sample: 0.37960100173950195, out-of-sample: 0.38266316056251526
+iteration 1: RMSE: in-sample: 0.8228806257247925, out-of-sample: 0.7908791303634644
+iteration 1: ACC: in-sample: 0.5472436604189637, out-of-sample: 0.5534215212414144
+iteration 1: TIME_M_SEC: 435.420145, TIME_E_SEC: 656.938808, TIME_TOTAL_SEC: 1092.401158
+iteration 2, MAE: in-sample: 0.38427895307540894, out-of-sample: 0.38986557722091675
+iteration 2: RMSE: in-sample: 1.5320924520492554, out-of-sample: 1.1447871923446655
+iteration 2: ACC: in-sample: 0.5495038588754134, out-of-sample: 0.5555838209107098
+iteration 2: TIME_M_SEC: 315.885505, TIME_E_SEC: 656.523479, TIME_TOTAL_SEC: 972.443153
+iteration 3, MAE: in-sample: 0.42171958088874817, out-of-sample: 0.3693525493144989
+iteration 3: RMSE: in-sample: 5.408350944519043, out-of-sample: 0.7835747003555298
+iteration 3: ACC: in-sample: 0.5495589856670342, out-of-sample: 0.5555838209107098
+iteration 3: TIME_M_SEC: 401.175072, TIME_E_SEC: 654.505385, TIME_TOTAL_SEC: 1055.715350
+iteration 4, MAE: in-sample: 3.2448742389678955, out-of-sample: 3.5414516925811768
+iteration 4: RMSE: in-sample: 28.918319702148438, out-of-sample: 39.14253234863281
+iteration 4: ACC: in-sample: 0.5429437706725468, out-of-sample: 0.5478249809208853
+iteration 4: TIME_M_SEC: 379.371072, TIME_E_SEC: 654.116468, TIME_TOTAL_SEC: 1033.523748
+iteration 5, MAE: in-sample: 327.14947509765625, out-of-sample: 3.8645713329315186
+iteration 5: RMSE: in-sample: 33024.78125, out-of-sample: 41.82939910888672
+iteration 5: ACC: in-sample: 0.5373759647188534, out-of-sample: 0.5438819638768762
+iteration 5: TIME_M_SEC: 387.689504, TIME_E_SEC: 652.470135, TIME_TOTAL_SEC: 1040.193094
