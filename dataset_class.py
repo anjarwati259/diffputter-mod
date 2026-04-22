@@ -271,7 +271,7 @@ def train_supervised_embedding_model(cat_idx_array: np.ndarray,
     # Loss weights: reconstruction dinaikkan agar decoder lebih terlatih untuk imputasi.
     # alpha diturunkan sedikit; beta dinaikkan ke 1.0 karena akurasi imputasi bergantung
     # langsung pada kualitas rekonstruksi embedding, bukan hanya klasifikasi.
-    alpha = 0.1 # classification loss weight
+    alpha = 0.7 # classification loss weight
     beta  = 1.0  # reconstruction loss weight
 
     model.train()
