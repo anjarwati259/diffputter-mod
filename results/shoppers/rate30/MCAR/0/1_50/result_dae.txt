@@ -12,3 +12,8 @@ iteration 0, Training time=1.7017s, In-sample imputation=46.8429s, Out-of-sample
 iteration 0, MDLP discretization=11.7583s, Embedding training=44.4954s, Total preprocessing (Diskrit+Emb)=56.2536s
 iteration 0, TOTAL pipeline (Diskrit-Imputasi)=125.7710s
 
+iteration 0, MAE: in-sample=0.701908, out-of-sample=0.714462
+iteration 0, RMSE: in-sample=1.092938, out-of-sample=1.100482
+iteration 0, ACC: in-sample=0.533186328555678, out-of-sample=0.5335792419231747
+iteration 0, Training time=676.32s, In-sample imputation=48.14s, Out-of-sample imputation=21.53s
+
