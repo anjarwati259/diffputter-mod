@@ -38,7 +38,7 @@ if not torch.cuda.is_available():
 if args.gpu == -1:
     args.gpu = 0  # default ke GPU 0 jika tidak dispesifikasi
 args.device = f'cuda:{args.gpu}'
-print(f"Menggunakan GPU: {torch.cuda.get_device_name(args.gpu)} (cuda:{args.gpu})")
+#print(f"Menggunakan GPU: {torch.cuda.get_device_name(args.gpu)} (cuda:{args.gpu})")
 
 datanames = ['shoppers'] 
 

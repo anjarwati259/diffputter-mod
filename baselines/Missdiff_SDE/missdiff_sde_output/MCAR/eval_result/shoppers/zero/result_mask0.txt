@@ -1,0 +1,3 @@
+MAE: in-sample: 0.706597089767456, out-of-sample: 0.6502318978309631 
+RMSE: in-sample: 9.509013175964355, out-of-sample: 7.695003986358643 
+ACC: in-sample: 0.5073869900771775, out-of-sample: 0.5131009921139659 
